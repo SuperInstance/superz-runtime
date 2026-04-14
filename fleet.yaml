@@ -1,0 +1,107 @@
+# ============================================================
+# SuperZ Runtime — Default Fleet Configuration
+# ============================================================
+# This file is auto-generated on first boot if it doesn't exist.
+# Copy to ~/.superinstance/fleet.yaml and customise as needed.
+# ============================================================
+
+runtime:
+  headless: false              # true = no TUI (daemon mode)
+  log_level: INFO              # DEBUG | INFO | WARNING | ERROR
+  health_interval: 30          # seconds between health polls
+  git_sync_interval: 300       # seconds between git pull on agent repos
+  max_restart_backoff: 60      # max seconds for exponential backoff
+  shutdown_timeout: 5          # seconds to wait before SIGKILL
+
+keeper:
+  host: 127.0.0.1
+  port: 8443
+  vault_path: ""               # defaults to ~/.superinstance/vault/
+  enabled: true
+
+git_agent:
+  host: 127.0.0.1
+  port: 8444
+  workshop_path: ""            # defaults to ~/.superinstance/workshop/
+  enabled: true
+
+# Fleet agents — cloned from SuperInstance org on GitHub
+agents:
+  - name: trail-agent
+    repo: trail-agent
+    port: 8501
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+  - name: trust-agent
+    repo: trust-agent
+    port: 8502
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+  - name: flux-vm-agent
+    repo: flux-vm-agent
+    port: 8503
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+  - name: knowledge-agent
+    repo: knowledge-agent
+    port: 8504
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+  - name: scheduler-agent
+    repo: scheduler-agent
+    port: 8505
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+  - name: edge-relay
+    repo: edge-relay
+    port: 8506
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+  - name: liaison-agent
+    repo: liaison-agent
+    port: 8507
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+  - name: cartridge-agent
+    repo: cartridge-agent
+    port: 8508
+    enabled: true
+    mode: serve
+    host: 127.0.0.1
+    branch: main
+
+mud:
+  enabled: true
+  port: 7777
+  host: 127.0.0.1
+  world_path: ""               # defaults to ~/.superinstance/worlds/
+
+network:
+  topology: star               # star | mesh
+  discovery: true
+  keeper_url: ""               # auto-set to http://127.0.0.1:8443
+
+secrets:
+  keeper_url: ""               # set via env: KEEPER_URL
+  github_token_env: GITHUB_TOKEN
