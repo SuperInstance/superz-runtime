@@ -1,107 +1,83 @@
-# ============================================================
-# SuperZ Runtime — Default Fleet Configuration
-# ============================================================
-# This file is auto-generated on first boot if it doesn't exist.
-# Copy to ~/.superinstance/fleet.yaml and customise as needed.
-# ============================================================
-
 runtime:
-  headless: false              # true = no TUI (daemon mode)
-  log_level: INFO              # DEBUG | INFO | WARNING | ERROR
-  health_interval: 30          # seconds between health polls
-  git_sync_interval: 300       # seconds between git pull on agent repos
-  max_restart_backoff: 60      # max seconds for exponential backoff
-  shutdown_timeout: 5          # seconds to wait before SIGKILL
+  headless: false
+  log_level: INFO
+  health_interval: 30
+  git_sync_interval: 300
+  auto_restart: true
+  max_restart_attempts: 5
+  restart_backoff_max: 60
 
 keeper:
-  host: 127.0.0.1
   port: 8443
-  vault_path: ""               # defaults to ~/.superinstance/vault/
-  enabled: true
+  vault_path: ~/.superinstance/keeper_vault
 
 git_agent:
-  host: 127.0.0.1
   port: 8444
-  workshop_path: ""            # defaults to ~/.superinstance/workshop/
-  enabled: true
 
-# Fleet agents — cloned from SuperInstance org on GitHub
 agents:
   - name: trail-agent
-    repo: trail-agent
+    repo: SuperInstance/trail-agent
     port: 8501
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
-
+    command: "python -m trail_agent.serve"
   - name: trust-agent
-    repo: trust-agent
+    repo: SuperInstance/trust-agent
     port: 8502
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
-
-  - name: flux-vm-agent
-    repo: flux-vm-agent
+    command: "python -m trust_agent.serve"
+  - name: compass-agent
+    repo: SuperInstance/compass-agent
     port: 8503
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
-
-  - name: knowledge-agent
-    repo: knowledge-agent
+    command: "python -m compass_agent.serve"
+  - name: echo-agent
+    repo: SuperInstance/echo-agent
     port: 8504
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
-
-  - name: scheduler-agent
-    repo: scheduler-agent
+    command: "python -m echo_agent.serve"
+  - name: atlas-agent
+    repo: SuperInstance/atlas-agent
     port: 8505
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
-
-  - name: edge-relay
-    repo: edge-relay
+    command: "python -m atlas_agent.serve"
+  - name: beacon-agent
+    repo: SuperInstance/beacon-agent
     port: 8506
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
-
-  - name: liaison-agent
-    repo: liaison-agent
+    command: "python -m beacon_agent.serve"
+  - name: scope-agent
+    repo: SuperInstance/scope-agent
     port: 8507
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
-
-  - name: cartridge-agent
-    repo: cartridge-agent
+    command: "python -m scope_agent.serve"
+  - name: forge-agent
+    repo: SuperInstance/forge-agent
     port: 8508
     enabled: true
-    mode: serve
-    host: 127.0.0.1
-    branch: main
+    command: "python -m forge_agent.serve"
+  - name: vault-agent
+    repo: SuperInstance/vault-agent
+    port: 8509
+    enabled: true
+    command: "python -m vault_agent.serve"
+  - name: tide-agent
+    repo: SuperInstance/tide-agent
+    port: 8510
+    enabled: true
+    command: "python -m tide_agent.serve"
+  - name: helm-agent
+    repo: SuperInstance/helm-agent
+    port: 8511
+    enabled: true
+    command: "python -m helm_agent.serve"
+  - name: crest-agent
+    repo: SuperInstance/crest-agent
+    port: 8512
+    enabled: true
+    command: "python -m crest_agent.serve"
 
 mud:
-  enabled: true
+  enabled: false
   port: 7777
-  host: 127.0.0.1
-  world_path: ""               # defaults to ~/.superinstance/worlds/
-
-network:
-  topology: star               # star | mesh
-  discovery: true
-  keeper_url: ""               # auto-set to http://127.0.0.1:8443
-
-secrets:
-  keeper_url: ""               # set via env: KEEPER_URL
-  github_token_env: GITHUB_TOKEN
+  bridge_port: 8877
+  holodeck_path: holodeck-studio/server.py

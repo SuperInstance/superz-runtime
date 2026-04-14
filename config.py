@@ -1,465 +1,309 @@
 """
-Unified Fleet Configuration for SuperZ Runtime.
+Unified Fleet Configuration — load, save, validate, generate defaults.
 
-Bridges pelagic-bootstrap, standalone-agent-scaffold, and holodeck-studio configs
-into a single fleet.yaml that the runtime consumes.
+Handles fleet.yaml parsing with type-safe accessors and sensible defaults
+so the runtime can always boot even without a config file.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 import copy
-import shutil
 import logging
-from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Any, Optional
 
-try:
-    import yaml
-except ImportError:
-    yaml = None  # type: ignore[assignment]
+import yaml
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("superz.config")
 
 # ---------------------------------------------------------------------------
-# Data models
+# Default configuration (merged into any user-provided fleet.yaml)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class AgentConfig:
-    """Configuration for a single fleet agent."""
-    name: str = ""
-    repo: str = ""
-    port: int = 8500
-    enabled: bool = True
-    mode: str = "serve"            # serve | work | listen
-    host: str = "127.0.0.1"
-    branch: str = "main"
-    onboarded: bool = False
-    health_endpoint: str = "/health"
+DEFAULT_FLEET_YAML = """\
+runtime:
+  headless: false
+  log_level: INFO
+  health_interval: 30
+  git_sync_interval: 300
+  auto_restart: true
+  max_restart_attempts: 5
+  restart_backoff_max: 60
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "repo": self.repo,
-            "port": self.port,
-            "enabled": self.enabled,
-            "mode": self.mode,
-            "host": self.host,
-            "branch": self.branch,
-            "onboarded": self.onboarded,
-            "health_endpoint": self.health_endpoint,
-        }
+keeper:
+  port: 8443
+  vault_path: ~/.superinstance/keeper_vault
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> AgentConfig:
-        return cls(
-            name=d.get("name", ""),
-            repo=d.get("repo", ""),
-            port=d.get("port", 8500),
-            enabled=d.get("enabled", True),
-            mode=d.get("mode", "serve"),
-            host=d.get("host", "127.0.0.1"),
-            branch=d.get("branch", "main"),
-            onboarded=d.get("onboarded", False),
-            health_endpoint=d.get("health_endpoint", "/health"),
-        )
+git_agent:
+  port: 8444
 
+agents:
+  - name: trail-agent
+    repo: SuperInstance/trail-agent
+    port: 8501
+    enabled: true
+    command: "python -m trail_agent.serve"
+  - name: trust-agent
+    repo: SuperInstance/trust-agent
+    port: 8502
+    enabled: true
+    command: "python -m trust_agent.serve"
+  - name: compass-agent
+    repo: SuperInstance/compass-agent
+    port: 8503
+    enabled: true
+    command: "python -m compass_agent.serve"
+  - name: echo-agent
+    repo: SuperInstance/echo-agent
+    port: 8504
+    enabled: true
+    command: "python -m echo_agent.serve"
+  - name: atlas-agent
+    repo: SuperInstance/atlas-agent
+    port: 8505
+    enabled: true
+    command: "python -m atlas_agent.serve"
+  - name: beacon-agent
+    repo: SuperInstance/beacon-agent
+    port: 8506
+    enabled: true
+    command: "python -m beacon_agent.serve"
+  - name: scope-agent
+    repo: SuperInstance/scope-agent
+    port: 8507
+    enabled: true
+    command: "python -m scope_agent.serve"
+  - name: forge-agent
+    repo: SuperInstance/forge-agent
+    port: 8508
+    enabled: true
+    command: "python -m forge_agent.serve"
+  - name: vault-agent
+    repo: SuperInstance/vault-agent
+    port: 8509
+    enabled: true
+    command: "python -m vault_agent.serve"
+  - name: tide-agent
+    repo: SuperInstance/tide-agent
+    port: 8510
+    enabled: true
+    command: "python -m tide_agent.serve"
+  - name: helm-agent
+    repo: SuperInstance/helm-agent
+    port: 8511
+    enabled: true
+    command: "python -m helm_agent.serve"
+  - name: crest-agent
+    repo: SuperInstance/crest-agent
+    port: 8512
+    enabled: true
+    command: "python -m crest_agent.serve"
 
-@dataclass
-class RuntimeConfig:
-    """Runtime behaviour settings."""
-    headless: bool = False
-    log_level: str = "INFO"
-    health_interval: int = 30        # seconds
-    git_sync_interval: int = 300     # seconds
-    max_restart_backoff: int = 60    # seconds
-    shutdown_timeout: int = 5        # seconds
+mud:
+  enabled: false
+  port: 7777
+  bridge_port: 8877
+  holodeck_path: holodeck-studio/server.py
+"""
 
-
-@dataclass
-class KeeperConfig:
-    """Keeper Agent configuration."""
-    host: str = "127.0.0.1"
-    port: int = 8443
-    vault_path: str = ""             # defaults to ~/.superinstance/vault/
-    enabled: bool = True
-
-
-@dataclass
-class GitAgentConfig:
-    """Git Agent (co-captain) configuration."""
-    host: str = "127.0.0.1"
-    port: int = 8444
-    workshop_path: str = ""          # defaults to ~/.superinstance/workshop/
-    enabled: bool = True
-
-
-@dataclass
-class MudConfig:
-    """Holodeck MUD server configuration."""
-    enabled: bool = True
-    port: int = 7777
-    host: str = "127.0.0.1"
-    world_path: str = ""             # defaults to ~/.superinstance/worlds/
-
-
-@dataclass
-class NetworkConfig:
-    """Fleet network topology settings."""
-    topology: str = "star"           # star | mesh
-    discovery: bool = True
-    keeper_url: str = ""             # set at runtime
-
-
-@dataclass
-class SecretsConfig:
-    """Secrets references (never actual secret values)."""
-    keeper_url: str = ""
-    github_token_env: str = "GITHUB_TOKEN"
+# Reserved port ranges
+_KEEPER_PORT = 8443
+_GIT_AGENT_PORT = 8444
 
 
-# ---------------------------------------------------------------------------
-# FleetConfig — the unified container
-# ---------------------------------------------------------------------------
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base* (base values are defaults)."""
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
 
 class FleetConfig:
-    """Unified configuration for the entire Pelagic fleet.
-
-    Loads from ``fleet.yaml`` (YAML), environment variables, or built-in
-    defaults.  Validates ports, paths, and agent lists before the runtime
-    can use them.
+    """Load, save, validate, and query fleet configuration.
 
     Usage::
 
-        cfg = FleetConfig.load("/path/to/fleet.yaml")
-        print(cfg.runtime.headless)
+        cfg = FleetConfig.load(path="fleet.yaml")
+        agents = cfg.enabled_agents()
+        port = cfg.get_agent("trail-agent")["port"]
     """
 
-    DEFAULT_INSTANCE_DIR = Path.home() / ".superinstance"
-    DEFAULT_AGENTS_DIR = DEFAULT_INSTANCE_DIR / "agents"
-    DEFAULT_LOGS_DIR = DEFAULT_INSTANCE_DIR / "logs"
-    DEFAULT_VAULT_DIR = DEFAULT_INSTANCE_DIR / "vault"
-    DEFAULT_WORKSHOP_DIR = DEFAULT_INSTANCE_DIR / "workshop"
-    DEFAULT_WORLDS_DIR = DEFAULT_INSTANCE_DIR / "worlds"
-    DEFAULT_CONFIG_PATH = DEFAULT_INSTANCE_DIR / "fleet.yaml"
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data: dict[str, Any] = data
 
-    # The canonical SuperInstance GitHub org for fleet agents
-    GITHUB_ORG = "SuperInstance"
-
-    # Default fleet agents
-    DEFAULT_AGENTS: list[dict[str, Any]] = [
-        {"name": "trail-agent",      "repo": "trail-agent",      "port": 8501, "enabled": True,  "mode": "serve"},
-        {"name": "trust-agent",      "repo": "trust-agent",      "port": 8502, "enabled": True,  "mode": "serve"},
-        {"name": "flux-vm-agent",    "repo": "flux-vm-agent",    "port": 8503, "enabled": True,  "mode": "serve"},
-        {"name": "knowledge-agent",  "repo": "knowledge-agent",  "port": 8504, "enabled": True,  "mode": "serve"},
-        {"name": "scheduler-agent",  "repo": "scheduler-agent",  "port": 8505, "enabled": True,  "mode": "serve"},
-        {"name": "edge-relay",       "repo": "edge-relay",       "port": 8506, "enabled": True,  "mode": "serve"},
-        {"name": "liaison-agent",    "repo": "liaison-agent",    "port": 8507, "enabled": True,  "mode": "serve"},
-        {"name": "cartridge-agent",  "repo": "cartridge-agent",  "port": 8508, "enabled": True,  "mode": "serve"},
-    ]
-
-    def __init__(self) -> None:
-        self.runtime: RuntimeConfig = RuntimeConfig()
-        self.keeper: KeeperConfig = KeeperConfig()
-        self.git_agent: GitAgentConfig = GitAgentConfig()
-        self.agents: list[AgentConfig] = [
-            AgentConfig.from_dict(a) for a in self.DEFAULT_AGENTS
-        ]
-        self.mud: MudConfig = MudConfig()
-        self.network: NetworkConfig = NetworkConfig()
-        self.secrets: SecretsConfig = SecretsConfig()
-        self.config_path: Optional[Path] = None
-
-    # ------------------------------------------------------------------
-    # Loading
-    # ------------------------------------------------------------------
+    # ---- factory helpers ---------------------------------------------------
 
     @classmethod
-    def load(cls, path: Optional[str] = None) -> FleetConfig:
-        """Load configuration from a YAML file, falling back to defaults.
+    def load(cls, path: Optional[str | Path] = None) -> "FleetConfig":
+        """Load from *path*, or generate built-in defaults when missing."""
+        if path is None:
+            path = Path.cwd() / "fleet.yaml"
+        path = Path(path).expanduser().resolve()
 
-        Search order:
-        1. Explicit *path* argument
-        2. ``FLEET_CONFIG`` environment variable
-        3. ``~/.superinstance/fleet.yaml``
-        4. Built-in defaults
-        """
-        cfg = cls()
-
-        resolve_path = path or os.environ.get("FLEET_CONFIG")
-        if resolve_path:
-            cfg.config_path = Path(resolve_path).expanduser().resolve()
-        else:
-            cfg.config_path = cls.DEFAULT_CONFIG_PATH
-
-        if cfg.config_path.exists():
-            cfg._load_from_yaml(cfg.config_path)
-            logger.info("Loaded config from %s", cfg.config_path)
-        else:
-            logger.info("No config file found — using defaults")
-
-        cfg._apply_env_overrides()
-        cfg._fill_defaults()
-        return cfg
-
-    def _load_from_yaml(self, path: Path) -> None:
-        """Parse a YAML config file and populate fields."""
-        if yaml is None:
-            logger.warning("PyYAML not installed — cannot read %s", path)
-            return
-
-        try:
+        if path.exists():
+            logger.info("Loading config from %s", path)
             with open(path, "r", encoding="utf-8") as fh:
-                raw: dict[str, Any] = yaml.safe_load(fh) or {}
-        except Exception as exc:
-            logger.error("Failed to parse %s: %s", path, exc)
-            return
+                user_data: dict[str, Any] = yaml.safe_load(fh) or {}
+        else:
+            logger.warning("No config at %s — using defaults", path)
+            user_data = {}
 
-        # Runtime
-        rt = raw.get("runtime", {})
-        self.runtime.headless = rt.get("headless", self.runtime.headless)
-        self.runtime.log_level = rt.get("log_level", self.runtime.log_level)
-        self.runtime.health_interval = rt.get("health_interval", self.runtime.health_interval)
-        self.runtime.git_sync_interval = rt.get("git_sync_interval", self.runtime.git_sync_interval)
-        self.runtime.max_restart_backoff = rt.get("max_restart_backoff", self.runtime.max_restart_backoff)
-        self.runtime.shutdown_timeout = rt.get("shutdown_timeout", self.runtime.shutdown_timeout)
+        defaults: dict[str, Any] = yaml.safe_load(DEFAULT_FLEET_YAML)
+        merged = _deep_merge(defaults, user_data)
+        return cls(merged)
 
-        # Keeper
-        kp = raw.get("keeper", {})
-        self.keeper.host = kp.get("host", self.keeper.host)
-        self.keeper.port = kp.get("port", self.keeper.port)
-        self.keeper.vault_path = kp.get("vault_path", self.keeper.vault_path)
-        self.keeper.enabled = kp.get("enabled", self.keeper.enabled)
+    @classmethod
+    def generate_defaults(cls) -> "FleetConfig":
+        """Return a config with only built-in defaults."""
+        return cls(yaml.safe_load(DEFAULT_FLEET_YAML))
 
-        # Git agent
-        ga = raw.get("git_agent", {})
-        self.git_agent.host = ga.get("host", self.git_agent.host)
-        self.git_agent.port = ga.get("port", self.git_agent.port)
-        self.git_agent.workshop_path = ga.get("workshop_path", self.git_agent.workshop_path)
-        self.git_agent.enabled = ga.get("enabled", self.git_agent.enabled)
+    # ---- persistence -------------------------------------------------------
 
-        # Agents
-        agents_raw = raw.get("agents", [])
-        if agents_raw:
-            self.agents = [AgentConfig.from_dict(a) for a in agents_raw]
+    def save(self, path: Optional[str | Path] = None) -> Path:
+        """Write current config to *path* (default ``fleet.yaml`` in cwd)."""
+        if path is None:
+            path = Path.cwd() / "fleet.yaml"
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.dump(self._data, fh, default_flow_style=False, sort_keys=False)
+        logger.info("Config saved to %s", path)
+        return path
 
-        # MUD
-        mud = raw.get("mud", {})
-        self.mud.enabled = mud.get("enabled", self.mud.enabled)
-        self.mud.port = mud.get("port", self.mud.port)
-        self.mud.host = mud.get("host", self.mud.host)
-        self.mud.world_path = mud.get("world_path", self.mud.world_path)
-
-        # Network
-        net = raw.get("network", {})
-        self.network.topology = net.get("topology", self.network.topology)
-        self.network.discovery = net.get("discovery", self.network.discovery)
-        self.network.keeper_url = net.get("keeper_url", self.network.keeper_url)
-
-        # Secrets
-        sec = raw.get("secrets", {})
-        self.secrets.keeper_url = sec.get("keeper_url", self.secrets.keeper_url)
-        self.secrets.github_token_env = sec.get("github_token_env", self.secrets.github_token_env)
-
-    def _apply_env_overrides(self) -> None:
-        """Let environment variables override specific settings."""
-        env_map: dict[str, Any] = {
-            "SUPERZ_HEADLESS": ("runtime", "headless", _parse_bool),
-            "SUPERZ_LOG_LEVEL": ("runtime", "log_level", str),
-            "KEEPER_PORT": ("keeper", "port", int),
-            "KEEPER_HOST": ("keeper", "host", str),
-            "GIT_AGENT_PORT": ("git_agent", "port", int),
-            "MUD_PORT": ("mud", "port", int),
-            "SUPERZ_SKIP_MUD": ("mud", "enabled", lambda v: not _parse_bool(v)),
-        }
-        for env_var, (section, attr, parser) in env_map.items():
-            val = os.environ.get(env_var)
-            if val is not None:
-                try:
-                    setattr(getattr(self, section), attr, parser(val))
-                    logger.debug("Env override: %s=%s -> %s.%s", env_var, val, section, attr)
-                except (ValueError, TypeError) as exc:
-                    logger.warning("Bad env var %s=%s: %s", env_var, val, exc)
-
-    def _fill_defaults(self) -> None:
-        """Resolve any still-empty paths to their defaults."""
-        if not self.keeper.vault_path:
-            self.keeper.vault_path = str(self.DEFAULT_VAULT_DIR)
-        if not self.git_agent.workshop_path:
-            self.git_agent.workshop_path = str(self.DEFAULT_WORKSHOP_DIR)
-        if not self.mud.world_path:
-            self.mud.world_path = str(self.DEFAULT_WORLDS_DIR)
-        if not self.network.keeper_url:
-            self.network.keeper_url = f"http://{self.keeper.host}:{self.keeper.port}"
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
+    # ---- validation --------------------------------------------------------
 
     def validate(self) -> list[str]:
-        """Validate the configuration.  Returns a list of error strings
-        (empty means the config is good)."""
+        """Return a list of validation error strings (empty = valid)."""
         errors: list[str] = []
-        ports_seen: dict[int, str] = {}
 
-        def _check_port(name: str, port: int) -> None:
-            if not (1 <= port <= 65535):
-                errors.append(f"{name}: port {port} out of range")
-                return
-            if port in ports_seen:
-                errors.append(f"Port conflict: {name} and {ports_seen[port]} both use port {port}")
-            ports_seen[port] = name
+        # runtime section
+        rt = self._data.get("runtime", {})
+        if not isinstance(rt, dict):
+            errors.append("'runtime' section must be a mapping")
+        else:
+            hi = rt.get("health_interval")
+            if hi is not None and (not isinstance(hi, int) or hi < 1):
+                errors.append("runtime.health_interval must be a positive integer")
 
-        _check_port("keeper", self.keeper.port)
-        _check_port("git_agent", self.git_agent.port)
-        if self.mud.enabled:
-            _check_port("mud", self.mud.port)
-        for agent in self.agents:
-            if agent.enabled:
-                _check_port(f"agent/{agent.name}", agent.port)
+        # keeper
+        keeper = self._data.get("keeper", {})
+        if not isinstance(keeper.get("port"), int):
+            errors.append("keeper.port must be an integer")
 
-        if self.runtime.health_interval < 5:
-            errors.append("runtime.health_interval must be >= 5 seconds")
-        if self.runtime.git_sync_interval < 30:
-            errors.append("runtime.git_sync_interval must be >= 30 seconds")
+        # git_agent
+        ga = self._data.get("git_agent", {})
+        if not isinstance(ga.get("port"), int):
+            errors.append("git_agent.port must be an integer")
 
-        valid_topologies = {"star", "mesh"}
-        if self.network.topology not in valid_topologies:
-            errors.append(f"network.topology must be one of {valid_topologies}")
+        # agents
+        agents = self._data.get("agents", [])
+        if not isinstance(agents, list):
+            errors.append("'agents' must be a list")
+        else:
+            seen_names: set[str] = set()
+            seen_ports: set[int] = set()
+            for i, agent in enumerate(agents):
+                if not isinstance(agent, dict):
+                    errors.append(f"agents[{i}] must be a mapping")
+                    continue
+                name = agent.get("name")
+                if not name or not isinstance(name, str):
+                    errors.append(f"agents[{i}].name is missing or not a string")
+                    continue
+                if name in seen_names:
+                    errors.append(f"Duplicate agent name: {name}")
+                seen_names.add(name)
+
+                port = agent.get("port")
+                if port is None or not isinstance(port, int):
+                    errors.append(f"{name}: port must be an integer")
+                elif port in seen_ports:
+                    errors.append(f"{name}: duplicate port {port}")
+                seen_ports.add(port)
+
+        # mud
+        mud = self._data.get("mud", {})
+        if not isinstance(mud, dict):
+            errors.append("'mud' section must be a mapping")
 
         return errors
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
+    def is_valid(self) -> bool:
+        return len(self.validate()) == 0
 
-    def save(self, path: Optional[Path] = None) -> Path:
-        """Write current configuration to a YAML file."""
-        target = path or self.config_path or self.DEFAULT_CONFIG_PATH
-        target.parent.mkdir(parents=True, exist_ok=True)
+    # ---- accessors ---------------------------------------------------------
 
-        if yaml is None:
-            logger.error("PyYAML not installed — cannot save config")
-            return target
+    def get(self, dotted_key: str, default: Any = None) -> Any:
+        """Retrieve a nested value via ``dotted.key.path``."""
+        keys = dotted_key.split(".")
+        node: Any = self._data
+        for k in keys:
+            if isinstance(node, dict):
+                node = node.get(k)
+                if node is None:
+                    return default
+            else:
+                return default
+        return node
 
-        data: dict[str, Any] = {
-            "runtime": {
-                "headless": self.runtime.headless,
-                "log_level": self.runtime.log_level,
-                "health_interval": self.runtime.health_interval,
-                "git_sync_interval": self.runtime.git_sync_interval,
-                "max_restart_backoff": self.runtime.max_restart_backoff,
-                "shutdown_timeout": self.runtime.shutdown_timeout,
-            },
-            "keeper": {
-                "host": self.keeper.host,
-                "port": self.keeper.port,
-                "vault_path": self.keeper.vault_path,
-                "enabled": self.keeper.enabled,
-            },
-            "git_agent": {
-                "host": self.git_agent.host,
-                "port": self.git_agent.port,
-                "workshop_path": self.git_agent.workshop_path,
-                "enabled": self.git_agent.enabled,
-            },
-            "agents": [a.to_dict() for a in self.agents],
-            "mud": {
-                "enabled": self.mud.enabled,
-                "port": self.mud.port,
-                "host": self.mud.host,
-                "world_path": self.mud.world_path,
-            },
-            "network": {
-                "topology": self.network.topology,
-                "discovery": self.network.discovery,
-                "keeper_url": self.network.keeper_url,
-            },
-            "secrets": {
-                "keeper_url": self.secrets.keeper_url,
-                "github_token_env": self.secrets.github_token_env,
-            },
-        }
+    @property
+    def runtime(self) -> dict[str, Any]:
+        return self._data.get("runtime", {})
 
-        with open(target, "w", encoding="utf-8") as fh:
-            yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
+    @property
+    def keeper(self) -> dict[str, Any]:
+        return self._data.get("keeper", {})
 
-        logger.info("Config saved to %s", target)
-        return target
+    @property
+    def git_agent(self) -> dict[str, Any]:
+        return self._data.get("git_agent", {})
 
-    def save_default(self, path: Optional[Path] = None) -> Path:
-        """Generate and save a default fleet.yaml."""
-        return self.save(path)
+    @property
+    def agents(self) -> list[dict[str, Any]]:
+        return self._data.get("agents", [])
 
-    # ------------------------------------------------------------------
-    # Directory helpers
-    # ------------------------------------------------------------------
+    @property
+    def mud(self) -> dict[str, Any]:
+        return self._data.get("mud", {})
 
-    def ensure_directories(self) -> None:
-        """Create all required instance directories."""
-        dirs = [
-            self.DEFAULT_INSTANCE_DIR,
-            self.DEFAULT_AGENTS_DIR,
-            self.DEFAULT_LOGS_DIR,
-            Path(self.keeper.vault_path),
-            Path(self.git_agent.workshop_path),
-            Path(self.mud.world_path),
-        ]
-        for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
-        logger.info("Instance directories ensured under %s", self.DEFAULT_INSTANCE_DIR)
+    def enabled_agents(self) -> list[dict[str, Any]]:
+        """Return only agents with ``enabled: true``."""
+        return [a for a in self.agents if a.get("enabled", False)]
 
-    # ------------------------------------------------------------------
-    # Agent filtering
-    # ------------------------------------------------------------------
+    def get_agent(self, name: str) -> Optional[dict[str, Any]]:
+        """Look up an agent by name (case-sensitive)."""
+        for agent in self.agents:
+            if agent.get("name") == name:
+                return agent
+        return None
 
-    def get_enabled_agents(self) -> list[AgentConfig]:
-        """Return only enabled agents."""
-        return [a for a in self.agents if a.enabled]
+    def get_all_ports(self) -> dict[str, int]:
+        """Return ``{service_name: port}`` for every known service."""
+        ports: dict[str, int] = {}
+        ports["keeper"] = self.keeper.get("port", _KEEPER_PORT)
+        ports["git-agent"] = self.git_agent.get("port", _GIT_AGENT_PORT)
+        for agent in self.agents:
+            name = agent.get("name", "unknown")
+            port = agent.get("port")
+            if port is not None:
+                ports[name] = port
+        if self.mud.get("enabled", False):
+            ports["mud"] = self.mud.get("port", 7777)
+            ports["mud-bridge"] = self.mud.get("bridge_port", 8877)
+        return ports
 
-    def filter_agents(self, names: Optional[list[str]] = None) -> list[AgentConfig]:
-        """Filter agents by name list.  ``None`` returns all enabled."""
-        if names is None:
-            return self.get_enabled_agents()
-        name_set = {n.strip().lower() for n in names}
-        return [a for a in self.agents if a.enabled and a.name.lower() in name_set]
-
-    # ------------------------------------------------------------------
-    # Bridge legacy paths
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def bridge_legacy_paths(cls) -> None:
-        """Migrate ``~/.pelagic/`` content to ``~/.superinstance/`` if it
-        exists and the new directory doesn't."""
-        old = Path.home() / ".pelagic"
-        new = cls.DEFAULT_INSTANCE_DIR
-        if old.exists() and not new.exists():
-            logger.info("Migrating legacy %s → %s", old, new)
-            shutil.copytree(str(old), str(new))
-        # Also ensure symlinks or references are noted
-        pelagic_agents = old / "agents"
-        if pelagic_agents.exists():
-            superz_agents = cls.DEFAULT_AGENTS_DIR
-            if not superz_agents.exists():
-                shutil.copytree(str(pelagic_agents), str(superz_agents))
-                logger.info("Copied legacy agents from %s", pelagic_agents)
+    # ---- repr --------------------------------------------------------------
 
     def __repr__(self) -> str:
-        enabled = sum(1 for a in self.agents if a.enabled)
+        agent_count = len(self.agents)
+        enabled_count = len(self.enabled_agents())
         return (
-            f"FleetConfig(agents={len(self.agents)}, enabled={enabled}, "
-            f"keeper=:{self.keeper.port}, git=:{self.git_agent.port})"
+            f"FleetConfig(agents={agent_count}, "
+            f"enabled={enabled_count}, "
+            f"mud={'on' if self.mud.get('enabled') else 'off'})"
         )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _parse_bool(value: str) -> bool:
-    """Parse common boolean representations."""
-    return value.lower() in {"1", "true", "yes", "on"}

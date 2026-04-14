@@ -1,439 +1,294 @@
 """
-Fleet Process Manager for SuperZ Runtime.
+Process Manager — spawn, track, health-check, and restart fleet agents.
 
-Manages fleet agent subprocesses — start, stop, restart, health check,
-auto-restart with exponential backoff, log rotation, and graceful shutdown.
+Each agent runs as a subprocess.Popen instance.  The manager tracks PIDs,
+captures stdout/stderr to per-agent log directories, and implements
+exponential-backoff auto-restart.
 """
 
 from __future__ import annotations
 
-import os
-import sys
-import time
-import signal
 import logging
+import os
+import signal
 import subprocess
-import threading
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
+from urllib.error import URLError
+from urllib.request import urlopen
 
-logger = logging.getLogger(__name__)
-
+logger = logging.getLogger("superz.process")
 
 # ---------------------------------------------------------------------------
-# Agent Process Model
+# Data classes
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AgentProcess:
-    """Tracks a single fleet agent subprocess."""
+    """Runtime state for a single managed agent."""
+
     name: str
-    port: int = 0
-    config: dict[str, Any] = field(default_factory=dict)
-    process: Optional[subprocess.Popen] = None
+    port: int
+    command: str
+    cwd: str
+    subprocess: Optional[subprocess.Popen] = None
     pid: Optional[int] = None
-    health_status: str = "unknown"     # unknown | starting | healthy | degraded | crashed | stopped
-    last_heartbeat: Optional[datetime] = None
-    started_at: Optional[datetime] = None
-    last_restart: Optional[datetime] = None
+    health_status: str = "DOWN"       # OK | WARN | ERR | DOWN
+    last_heartbeat: Optional[float] = None
     restart_count: int = 0
-    stdout_path: Optional[Path] = None
-    stderr_path: Optional[Path] = None
-    cwd: str = ""
-    cmd: list[str] = field(default_factory=list)
+    started_at: Optional[float] = None
     env: dict[str, str] = field(default_factory=dict)
+    log_dir: Optional[str] = None
 
     @property
-    def uptime(self) -> timedelta:
-        """How long the agent has been running."""
+    def uptime(self) -> float:
+        """Seconds since the agent was last started."""
         if self.started_at is None:
-            return timedelta(0)
-        end = datetime.now() if self.health_status in ("healthy", "starting", "degraded") else (self.last_restart or datetime.now())
-        return max(end - self.started_at, timedelta(0))
+            return 0.0
+        return time.time() - self.started_at
 
-    @property
-    def is_running(self) -> bool:
-        """Check if the underlying process is alive."""
-        if self.process is None:
-            return False
-        return self.process.poll() is None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "port": self.port,
-            "pid": self.pid,
-            "health_status": self.health_status,
-            "last_heartbeat": self.last_heartbeat.isoformat() if self.last_heartbeat else None,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "restart_count": self.restart_count,
-            "is_running": self.is_running,
-            "uptime_seconds": self.uptime.total_seconds(),
-        }
-
-
-# ---------------------------------------------------------------------------
-# Log Rotator
-# ---------------------------------------------------------------------------
-
-class LogRotator:
-    """Simple log rotation: keep last N log files per agent."""
-
-    MAX_LOGS = 5
-    MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-
-    def __init__(self, logs_dir: Path, max_logs: int = MAX_LOGS, max_bytes: int = MAX_BYTES) -> None:
-        self.logs_dir = logs_dir
-        self.max_logs = max_logs
-        self.max_bytes = max_bytes
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-
-    def get_log_path(self, agent_name: str, stream: str) -> Path:
-        """Return the current log path for an agent's stream."""
-        return self.logs_dir / f"{agent_name}.{stream}.log"
-
-    def rotate_if_needed(self, agent_name: str, stream: str) -> Path:
-        """Rotate log file if it exceeds max size."""
-        log_path = self.get_log_path(agent_name, stream)
-        if log_path.exists() and log_path.stat().st_size >= self.max_bytes:
-            self._rotate(agent_name, stream)
-        return log_path
-
-    def _rotate(self, agent_name: str, stream: str) -> None:
-        """Shift log files: .log.4 -> deleted, .log.3 -> .log.4, etc."""
-        log_path = self.get_log_path(agent_name, stream)
-        for i in range(self.max_logs - 1, 0, -1):
-            older = self.logs_dir / f"{agent_name}.{stream}.log.{i}"
-            newer = self.logs_dir / f"{agent_name}.{stream}.log.{i + 1}"
-            if older.exists():
-                older.rename(newer)
-        # Move current to .log.1
-        rotated = self.logs_dir / f"{agent_name}.{stream}.log.1"
-        if log_path.exists():
-            log_path.rename(rotated)
-
-    def cleanup_old_logs(self) -> None:
-        """Remove log files beyond the retention limit."""
-        for log_file in self.logs_dir.glob("*.log.*"):
-            try:
-                parts = log_file.name.split(".log.")
-                if len(parts) == 2:
-                    idx = int(parts[1])
-                    if idx > self.max_logs:
-                        log_file.unlink()
-                        logger.debug("Removed old log: %s", log_file)
-            except (ValueError, IndexError):
-                pass
-
-
-# ---------------------------------------------------------------------------
-# Process Manager
-# ---------------------------------------------------------------------------
 
 class ProcessManager:
-    """Manages fleet agent subprocesses — start, stop, restart, health check.
+    """Manage fleet agent subprocesses with health-checking and auto-restart.
 
-    Each agent runs as a child process with stdout/stderr captured to log files.
-    Crashed agents are automatically restarted with exponential backoff.
+    Parameters
+    ----------
+    base_instance_dir :
+        Path to ``~/.superinstance/`` — used for log storage.
+    max_restart_attempts :
+        Maximum consecutive restart attempts before giving up.
+    backoff_max :
+        Upper bound (seconds) for exponential back-off.
     """
 
     def __init__(
         self,
-        logs_dir: Path,
-        max_backoff: int = 60,
-        shutdown_timeout: int = 5,
+        base_instance_dir: str | Path = "~/.superinstance",
+        max_restart_attempts: int = 5,
+        backoff_max: int = 60,
     ) -> None:
-        self.logs_dir = logs_dir
-        self.max_backoff = max_backoff
-        self.shutdown_timeout = shutdown_timeout
-        self.processes: dict[str, AgentProcess] = {}
-        self.rotator = LogRotator(logs_dir)
-        self._lock = threading.Lock()
-        self._restart_timers: dict[str, threading.Timer] = {}
-        self._on_status_change: Optional[Callable[[str, str, str], None]] = None
-        self._shutting_down = False
+        self._base = Path(base_instance_dir).expanduser().resolve()
+        self._max_restarts = max_restart_attempts
+        self._backoff_max = backoff_max
+        self._agents: dict[str, AgentProcess] = {}
 
-    def set_status_callback(self, callback: Callable[[str, str, str], None]) -> None:
-        """Register a callback for status changes: (name, old_status, new_status)."""
-        self._on_status_change = callback
+    # ---- public API --------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Start / Stop
-    # ------------------------------------------------------------------
-
-    def start_agent(
+    def register(
         self,
         name: str,
-        cmd: list[str],
-        cwd: str = "",
+        command: str,
+        port: int,
+        cwd: str,
         env: Optional[dict[str, str]] = None,
-        port: int = 0,
-        config: Optional[dict[str, Any]] = None,
     ) -> AgentProcess:
-        """Start an agent as a subprocess and track it."""
-        with self._lock:
-            # Stop existing if running
-            if name in self.processes and self.processes[name].is_running:
-                self.stop_agent(name)
-
-            stdout_path = self.rotator.rotate_if_needed(name, "stdout")
-            stderr_path = self.rotator.rotate_if_needed(name, "stderr")
-
-            process_env = os.environ.copy()
-            if env:
-                process_env.update(env)
-
-            agent_proc = AgentProcess(
-                name=name,
-                port=port,
-                config=config or {},
-                cwd=cwd or os.getcwd(),
-                cmd=cmd,
-                env=process_env,
-                health_status="starting",
-                started_at=datetime.now(),
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                restart_count=0,
-            )
-
-            try:
-                stdout_fh = open(stdout_path, "a")  # noqa: SIM115
-                stderr_fh = open(stderr_path, "a")  # noqa: SIM115
-                agent_proc.process = subprocess.Popen(
-                    cmd,
-                    cwd=agent_proc.cwd,
-                    env=process_env,
-                    stdout=stdout_fh,
-                    stderr=stderr_fh,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                agent_proc.pid = agent_proc.process.pid
-                logger.info("Started %s (PID %d) on port %d", name, agent_proc.pid, port)
-            except (OSError, subprocess.SubprocessError) as exc:
-                logger.error("Failed to start %s: %s", name, exc)
-                agent_proc.health_status = "crashed"
-                # Close file handles on failure
-                for fh in (stdout_fh, stderr_fh):
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
-
-            self.processes[name] = agent_proc
-            return agent_proc
-
-    def stop_agent(self, name: str, timeout: Optional[int] = None) -> bool:
-        """Gracefully stop an agent.  Returns True if it stopped cleanly."""
-        with self._lock:
-            agent = self.processes.get(name)
-            if agent is None or not agent.is_running:
-                return True
-
-            # Cancel pending restart timer
-            if name in self._restart_timers:
-                self._restart_timers[name].cancel()
-                del self._restart_timers[name]
-
-            old_status = agent.health_status
-            timeout = timeout or self.shutdown_timeout
-            pid = agent.process.pid if agent.process else None
-
-            logger.info("Stopping %s (PID %d, timeout %ds)", name, pid, timeout)
-
-            try:
-                if agent.process:
-                    # Send SIGTERM
-                    agent.process.terminate()
-                    try:
-                        agent.process.wait(timeout=timeout)
-                        logger.info("%s stopped cleanly", name)
-                    except subprocess.TimeoutExpired:
-                        # Force SIGKILL
-                        logger.warning("%s did not stop in %ds — sending SIGKILL", name, timeout)
-                        agent.process.kill()
-                        agent.process.wait(timeout=3)
-                        logger.info("%s killed", name)
-            except (OSError, ProcessLookupError):
-                pass
-
-            self._set_status(agent, "stopped")
-            return True
-
-    def stop_all(self) -> None:
-        """Gracefully stop all tracked agents."""
-        self._shutting_down = True
-        logger.info("Stopping all %d agents...", len(self.processes))
-
-        # Cancel all restart timers
-        for name, timer in self._restart_timers.items():
-            timer.cancel()
-        self._restart_timers.clear()
-
-        # Stop each agent
-        for name in list(self.processes.keys()):
-            self.stop_agent(name)
-
-        self.rotator.cleanup_old_logs()
-        logger.info("All agents stopped")
-
-    # ------------------------------------------------------------------
-    # Restart with backoff
-    # ------------------------------------------------------------------
-
-    def schedule_restart(self, name: str) -> None:
-        """Schedule an automatic restart with exponential backoff."""
-        if self._shutting_down:
-            return
-
-        agent = self.processes.get(name)
-        if agent is None:
-            return
-
-        backoff = min(2 ** agent.restart_count, self.max_backoff)
-        agent.restart_count += 1
-        agent.last_restart = datetime.now()
-
-        logger.info(
-            "Scheduling restart of %s in %ds (attempt #%d)",
-            name, backoff, agent.restart_count,
-        )
-
-        timer = threading.Timer(backoff, self._do_restart, args=(name,))
-        self._restart_timers[name] = timer
-        timer.daemon = True
-        timer.start()
-
-    def _do_restart(self, name: str) -> None:
-        """Execute a restart for a crashed agent."""
-        if self._shutting_down:
-            return
-        agent = self.processes.get(name)
-        if agent is None:
-            return
-
-        logger.info("Restarting %s...", name)
-
-        # Close old file handles
-        if agent.process:
-            try:
-                agent.process.stdout.close()  # type: ignore[union-attr]
-                agent.process.stderr.close()  # type: ignore[union-attr]
-            except Exception:
-                pass
-
-        new_agent = self.start_agent(
+        """Register an agent without starting it."""
+        log_dir = self._base / "logs" / name
+        log_dir.mkdir(parents=True, exist_ok=True)
+        proc = AgentProcess(
             name=name,
-            cmd=agent.cmd,
-            cwd=agent.cwd,
-            env=agent.env,
-            port=agent.port,
-            config=agent.config,
+            port=port,
+            command=command,
+            cwd=str(cwd),
+            env=env or {},
+            log_dir=str(log_dir),
         )
-        new_agent.restart_count = agent.restart_count
+        self._agents[name] = proc
+        return proc
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
-
-    def _set_status(self, agent: AgentProcess, new_status: str) -> None:
-        """Update agent status and notify callback."""
-        old = agent.health_status
-        agent.health_status = new_status
-        if new_status == "healthy":
-            agent.last_heartbeat = datetime.now()
-        if self._on_status_change and old != new_status:
-            try:
-                self._on_status_change(agent.name, old, new_status)
-            except Exception as exc:
-                logger.warning("Status callback error: %s", exc)
-
-    def set_healthy(self, name: str) -> None:
-        agent = self.processes.get(name)
-        if agent:
-            self._set_status(agent, "healthy")
-
-    def set_degraded(self, name: str) -> None:
-        agent = self.processes.get(name)
-        if agent:
-            self._set_status(agent, "degraded")
-
-    def set_crashed(self, name: str) -> None:
-        agent = self.processes.get(name)
-        if agent:
-            self._set_status(agent, "crashed")
-            if not self._shutting_down:
-                self.schedule_restart(name)
-
-    def get_all(self) -> dict[str, AgentProcess]:
-        """Return a snapshot of all tracked processes."""
-        return dict(self.processes)
-
-    def get_running(self) -> dict[str, AgentProcess]:
-        """Return only currently-running processes."""
-        return {n: p for n, p in self.processes.items() if p.is_running}
-
-    def check_and_restart_dead(self) -> list[str]:
-        """Poll all processes and auto-restart any that have died.
-        Returns list of agent names that were restarted."""
-        restarted: list[str] = []
-        for name, agent in self.processes.items():
-            if agent.health_status in ("healthy", "starting", "degraded") and not agent.is_running:
-                if agent.process:
-                    code = agent.process.poll()
-                    logger.warning(
-                        "%s died with exit code %d",
-                        name, code if code is not None else "unknown",
-                    )
-                self.set_crashed(name)
-                restarted.append(name)
-        return restarted
-
-    # ------------------------------------------------------------------
-    # PID file management
-    # ------------------------------------------------------------------
-
-    def write_pid_file(self, path: Path) -> None:
-        """Write the runtime's own PID to a file."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(os.getpid()))
-        logger.debug("PID file written: %s", path)
-
-    @staticmethod
-    def read_pid_file(path: Path) -> Optional[int]:
-        """Read a PID from a file.  Returns None if missing or invalid."""
-        try:
-            return int(path.read_text().strip())
-        except (FileNotFoundError, ValueError):
+    def start_agent(self, name: str) -> Optional[int]:
+        """Launch a registered agent subprocess; returns PID or *None*."""
+        proc = self._agents.get(name)
+        if proc is None:
+            logger.error("Unknown agent: %s", name)
             return None
 
-    @staticmethod
-    def remove_pid_file(path: Path) -> None:
-        """Remove a PID file."""
+        if proc.subprocess is not None and proc.subprocess.poll() is None:
+            logger.warning("%s is already running (pid %s)", name, proc.pid)
+            return proc.pid
+
+        # Ensure log directory exists
+        log_path = Path(proc.log_dir) if proc.log_dir else None
+        if log_path:
+            log_path.mkdir(parents=True, exist_ok=True)
+
+        stdout_fh = open(log_path / "stdout.log", "a") if log_path else subprocess.DEVNULL  # noqa: SIM115
+        stderr_fh = open(log_path / "stderr.log", "a") if log_path else subprocess.DEVNULL  # noqa: SIM115
+
+        merged_env = os.environ.copy()
+        merged_env.update(proc.env)
+
         try:
-            path.unlink()
-        except FileNotFoundError:
+            popen = subprocess.Popen(
+                proc.command.split(),
+                cwd=proc.cwd,
+                stdout=stdout_fh,
+                stderr=stderr_fh,
+                env=merged_env,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            logger.error("Failed to start %s: %s", name, exc)
+            proc.health_status = "ERR"
+            if isinstance(stdout_fh, int):
+                pass
+            else:
+                stdout_fh.close()
+            if isinstance(stderr_fh, int):
+                pass
+            else:
+                stderr_fh.close()
+            return None
+        except OSError as exc:
+            logger.error("Failed to start %s: %s", name, exc)
+            proc.health_status = "ERR"
+            if not isinstance(stdout_fh, int):
+                stdout_fh.close()
+            if not isinstance(stderr_fh, int):
+                stderr_fh.close()
+            return None
+
+        proc.subprocess = popen
+        proc.pid = popen.pid
+        proc.started_at = time.time()
+        proc.health_status = "WARN"  # until first health-check succeeds
+        proc.last_heartbeat = time.time()
+        logger.info("Started %s (pid=%d) on port %d", name, proc.pid, proc.port)
+        return proc.pid
+
+    def stop_agent(self, name: str, timeout: float = 5.0) -> bool:
+        """Gracefully stop an agent: SIGTERM → wait → SIGKILL."""
+        proc = self._agents.get(name)
+        if proc is None or proc.subprocess is None:
+            logger.warning("Cannot stop %s — not tracked", name)
+            return False
+
+        pid = proc.pid
+        logger.info("Stopping %s (pid=%d) …", name, pid)
+
+        # Try SIGTERM first
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
             pass
 
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
+        try:
+            proc.subprocess.wait(timeout=timeout)
+            logger.info("%s stopped gracefully", name)
+        except subprocess.TimeoutExpired:
+            logger.warning("%s did not stop in %.1fs — sending SIGKILL", name, timeout)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.subprocess.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                logger.error("%s refused to die", name)
 
-    def summary(self) -> dict[str, Any]:
-        """Return a summary dict of all processes."""
-        total = len(self.processes)
-        running = sum(1 for p in self.processes.values() if p.is_running)
-        healthy = sum(1 for p in self.processes.values() if p.health_status == "healthy")
-        crashed = sum(1 for p in self.processes.values() if p.health_status == "crashed")
+        proc.health_status = "DOWN"
+        proc.subprocess = None
+        proc.pid = None
+        proc.started_at = None
+        return True
 
-        return {
-            "total": total,
-            "running": running,
-            "healthy": healthy,
-            "crashed": crashed,
-            "stopped": total - running,
-            "processes": {n: p.to_dict() for n, p in self.processes.items()},
-        }
+    def restart_agent(self, name: str) -> Optional[int]:
+        """Stop then start an agent.  Returns new PID or *None*."""
+        self.stop_agent(name, timeout=3)
+        return self.start_agent(name)
+
+    def check_health(self, name: str) -> str:
+        """Return health status string: OK / WARN / ERR / DOWN.
+
+        Strategy:
+        1. If subprocess is gone → DOWN
+        2. Try HTTP GET ``http://localhost:{port}/health`` → OK
+        3. If subprocess alive but HTTP fails → WARN
+        """
+        proc = self._agents.get(name)
+        if proc is None:
+            return "DOWN"
+
+        # Process still running?
+        if proc.subprocess is not None and proc.subprocess.poll() is not None:
+            proc.health_status = "DOWN"
+            return "DOWN"
+
+        # HTTP health check
+        if proc.subprocess is not None:
+            try:
+                url = f"http://localhost:{proc.port}/health"
+                with urlopen(url, timeout=3) as resp:
+                    if resp.status < 400:
+                        proc.health_status = "OK"
+                        proc.last_heartbeat = time.time()
+                        return "OK"
+                    else:
+                        proc.health_status = "ERR"
+                        return "ERR"
+            except (URLError, OSError, TimeoutError, ConnectionError):
+                proc.health_status = "WARN"
+                proc.last_heartbeat = time.time()
+                return "WARN"
+            except Exception:
+                proc.health_status = "WARN"
+                return "WARN"
+
+        return "DOWN"
+
+    def get_status(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of all agents' current status."""
+        result: dict[str, dict[str, Any]] = {}
+        for name, proc in self._agents.items():
+            result[name] = {
+                "name": proc.name,
+                "port": proc.port,
+                "pid": proc.pid,
+                "status": proc.health_status,
+                "uptime": round(proc.uptime, 1),
+                "restart_count": proc.restart_count,
+                "command": proc.command,
+            }
+        return result
+
+    def stop_all(self) -> None:
+        """Stop every agent in reverse registration order."""
+        names = list(self._agents.keys())
+        for name in reversed(names):
+            self.stop_agent(name)
+        logger.info("All agents stopped")
+
+    def auto_restart(self, name: str) -> Optional[int]:
+        """Attempt to restart a crashed agent with exponential back-off.
+
+        Returns new PID if restarted, *None* if the agent has exceeded
+        ``max_restart_attempts``.
+        """
+        proc = self._agents.get(name)
+        if proc is None:
+            return None
+
+        if proc.restart_count >= self._max_restarts:
+            logger.error(
+                "%s has exceeded %d restart attempts — giving up",
+                name, self._max_restarts,
+            )
+            return None
+
+        backoff = min(2 ** proc.restart_count, self._backoff_max)
+        logger.info("Restarting %s in %ds (attempt %d/%d)", name, backoff, proc.restart_count + 1, self._max_restarts)
+        time.sleep(backoff)
+        proc.restart_count += 1
+        pid = self.start_agent(name)
+        if pid is None:
+            return self.auto_restart(name)
+        return pid
+
+    @property
+    def agent_names(self) -> list[str]:
+        return list(self._agents.keys())
+
+    def get_agent(self, name: str) -> Optional[AgentProcess]:
+        return self._agents.get(name)

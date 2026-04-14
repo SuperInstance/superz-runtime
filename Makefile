@@ -1,60 +1,58 @@
-.PHONY: boot boot-headless stop status doctor clean test help install
+.PHONY: boot boot-headless stop status doctor clean test
 
-# Default target
-help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+# ── Run the runtime with TUI ────────────────────────────────────────
+boot:
+	python runtime.py
 
-install: ## Install dependencies
-	pip install -e ".[dev]"
+# ── Run in headless/daemon mode ─────────────────────────────────────
+boot-headless:
+	python runtime.py --headless
 
-boot: ## Boot the full fleet with TUI
-	python -m superz_runtime
+# ── Boot with specific agents only ──────────────────────────────────
+boot-agents:
+	python runtime.py --agents trail-agent,trust-agent
 
-boot-headless: ## Boot without TUI (daemon mode)
-	python -m superz_runtime --headless
+# ── Stop all running agents (kill superz processes) ─────────────────
+stop:
+	pkill -f "superz_runtime" 2>/dev/null || true
+	@echo "Fleet stopped."
 
-boot-skip-mud: ## Boot without MUD server
-	python -m superz_runtime --skip-mud
+# ── Show fleet status (check which ports are listening) ─────────────
+status:
+	@echo "=== SuperZ Fleet Status ==="
+	@for port in 8443 8444 8501 8502 8503 8504 8505 8506 8507 8508 8509 8510 8511 8512; do \
+		if command -v lsof > /dev/null 2>&1; then \
+			if lsof -i :$$port -sTCP:LISTEN > /dev/null 2>&1; then \
+				echo "  ✓ Port $$port — LISTENING"; \
+			else \
+				echo "  ✗ Port $$port — closed"; \
+			fi; \
+		elif command -v ss > /dev/null 2>&1; then \
+			if ss -tlnp | grep -q ":$$port "; then \
+				echo "  ✓ Port $$port — LISTENING"; \
+			else \
+				echo "  ✗ Port $$port — closed"; \
+			fi; \
+		else \
+			echo "  ? Port $$port — cannot check (no lsof/ss)"; \
+		fi; \
+	done
 
-boot-agents: ## Boot specific agents (usage: make boot-agents AGENTS=trail,trust)
-	python -m superz_runtime --agents $(AGENTS)
+# ── Environment doctor ──────────────────────────────────────────────
+doctor:
+	@echo "=== SuperZ Doctor ==="
+	@echo "Python: $$(python3 --version 2>&1)"
+	@echo "Git:    $$(git --version 2>&1)"
+	@echo "PyYAML: $$(python3 -c 'import yaml; print(yaml.__version__)' 2>&1)"
+	@echo "Instance dir: $${HOME}/.superinstance"
+	@test -d "$${HOME}/.superinstance" && echo "  ✓ exists" || echo "  ✗ missing"
+	@test -f fleet.yaml && echo "Config:  fleet.yaml ✓" || echo "Config:  fleet.yaml ✗ (will use defaults)"
 
-stop: ## Stop all running agents
-	python -m superz_runtime --stop
-
-status: ## Show fleet health status
-	python -m superz_runtime --status
-
-doctor: ## Diagnose runtime issues
-	python -m superz_runtime --doctor
-
-clean: ## Clean all runtime state (logs, PID files, etc.)
-	rm -rf ~/.superinstance/logs/*.log*
-	rm -f ~/.superinstance/superz_runtime.pid
-	@echo "Cleaned logs and PID files"
-
-clean-all: ## Remove entire ~/.superinstance/ directory
+# ── Clean instance data ─────────────────────────────────────────────
+clean:
 	rm -rf ~/.superinstance
-	@echo "Removed ~/.superinstance/"
+	@echo "Instance data cleaned."
 
-test: ## Run all tests
-	python -m pytest tests/ -v
-
-test-coverage: ## Run tests with coverage
-	python -m pytest tests/ -v --cov=. --cov-report=term-missing
-
-lint: ## Run linter
-	python -m ruff check .
-
-docker-build: ## Build Docker image
-	docker compose build
-
-docker-up: ## Start fleet with Docker Compose
-	docker compose up -d
-
-docker-down: ## Stop Docker Compose stack
-	docker compose down
-
-docker-logs: ## Follow Docker Compose logs
-	docker compose logs -f
+# ── Run tests ────────────────────────────────────────────────────────
+test:
+	python3 -m pytest tests/ -v

@@ -1,209 +1,102 @@
 # SuperZ Runtime
 
-> **Clone this repo, run one command, everything starts.**
-
-The SuperZ Runtime is a self-booting Pelagic fleet engine. It clones, configures, launches, and monitors the entire fleet of agents from a single entry point.
+**Self-booting Pelagic fleet runtime.** Clone, configure, and launch the entire agent fleet with a single command.
 
 ## Quick Start
 
-### Local (Python 3.10+)
-
 ```bash
-# Clone the runtime
-git clone https://github.com/SuperInstance/superz-runtime.git
-cd superz-runtime
+# 1. Clone the runtime
+git clone <repo-url> superz-runtime && cd superz-runtime
 
-# Install dependencies
-pip install pyyaml
+# 2. Boot the fleet (interactive TUI)
+python runtime.py
 
-# Boot the fleet (with TUI dashboard)
-python -m superz_runtime
+# Or headless mode
+python runtime.py --headless
 
-# Or headless (daemon mode)
-python -m superz_runtime --headless
+# Only specific agents
+python runtime.py --agents trail-agent,trust-agent
 ```
 
-### Docker
+## Docker
 
 ```bash
-# Clone and build
-git clone https://github.com/SuperInstance/superz-runtime.git
-cd superz-runtime
+# Build and run
+docker compose up --build
 
-# Start the full fleet
+# Headless mode (recommended for containers)
 docker compose up -d
-
-# View logs
-docker compose logs -f
-
-# Stop
-docker compose down
-```
-
-## Commands
-
-```bash
-python -m superz_runtime                  # Boot with TUI
-python -m superz_runtime --headless       # Daemon mode
-python -m superz_runtime --skip-mud       # Skip MUD server
-python -m superz_runtime --agents trail,trust  # Specific agents only
-python -m superz_runtime --config my.yaml # Custom config
-python -m superz_runtime --doctor         # Diagnose issues
-python -m superz_runtime --status         # Fleet health status
-python -m superz_runtime --stop           # Stop running fleet
-```
-
-Or via Make:
-
-```bash
-make boot            # Full fleet with TUI
-make boot-headless   # Daemon mode
-make stop            # Stop all agents
-make status          # Show health
-make doctor          # Diagnose issues
-make test            # Run tests
 ```
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  SUPERZ RUNTIME                       │
-│  ┌────────────────────────────────────────────────┐  │
-│  │              runtime.py                         │  │
-│  │  Phase 1: Environment Check                    │  │
-│  │  Phase 2: Fleet Bootstrap (clone/onboard)      │  │
-│  │  Phase 3: Infrastructure (Keeper + Git)        │  │
-│  │  Phase 4: Launch Agents (parallel)             │  │
-│  │  Phase 5: MUD Server (holodeck-studio)         │  │
-│  │  Phase 6: Health Monitoring + Git Sync         │  │
-│  └──────────┬─────────────────┬───────────────────┘  │
-│             │                 │                       │
-│  ┌──────────▼──┐   ┌─────────▼──────┐               │
-│  │ config.py   │   │ process_       │               │
-│  │ fleet.yaml  │   │ manager.py     │               │
-│  │ env vars    │   │ start/stop/    │               │
-│  │ defaults    │   │ restart/backoff│               │
-│  └─────────────┘   └───────┬────────┘               │
-│                             │                        │
-│  ┌─────────────────┐  ┌────▼──────────┐             │
-│  │ health_         │  │ agent_        │             │
-│  │ monitor.py      │  │ launcher.py   │             │
-│  │ /health polling │  │ clone/onboard │             │
-│  │ fleet score     │  │ build cmd     │             │
-│  │ alerts          │  │ inject env    │             │
-│  └─────────────────┘  └───────────────┘             │
-└──────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│           FLEET AGENTS                  │
-│  ┌──────────┐  ┌──────────┐            │
-│  │ Keeper   │  │ Git      │  :8443/44  │
-│  │ Agent    │  │ Agent    │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────┐  ┌──────────┐            │
-│  │ Trail    │  │ Trust    │  :8501/02  │
-│  │ Agent    │  │ Agent    │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────┐  ┌──────────┐            │
-│  │ Flux VM  │  │Knowledge │  :8503/04  │
-│  │ Agent    │  │ Agent    │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────┐  ┌──────────┐            │
-│  │Scheduler │  │ Edge     │  :8505/06  │
-│  │ Agent    │  │ Relay    │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────┐  ┌──────────┐            │
-│  │ Liaison  │  │Cartridge │  :8507/08  │
-│  │ Agent    │  │ Agent    │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────────────────────┐          │
-│  │ Holodeck MUD Server      │  :7777   │
-│  └──────────────────────────┘          │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                  SuperZ Runtime                   │
+│              (runtime.py / TUI)                   │
+├──────────┬──────────┬──────────┬─────────────────┤
+│  Keeper  │ Git Agent│  Fleet   │  MUD (optional) │
+│  :8443   │  :8444   │ :8501-12 │  :7777          │
+├──────────┴──────────┴──────────┴─────────────────┤
+│            Process Manager                       │
+│     (start / stop / health / restart)            │
+├──────────────────────────────────────────────────┤
+│           Agent Launcher                         │
+│     (clone / onboard / build command)            │
+├──────────────────────────────────────────────────┤
+│           Fleet Config (fleet.yaml)              │
+└──────────────────────────────────────────────────┘
 ```
+
+### Boot Phases
+
+1. **Environment Check** — Python 3.10+, git, create `~/.superinstance/`
+2. **Load Config** — parse `fleet.yaml` or generate defaults
+3. **Start Keeper** — port 8443
+4. **Start Git Agent** — port 8444
+5. **Launch Fleet** — clone & start each enabled agent
+6. **Start MUD** — optional holodeck server on port 7777
+7. **Health Loop** — poll every 30s, auto-restart crashed agents
+8. **Shutdown** — SIGTERM/SIGINT → stop all in reverse order
+
+## Fleet Agents
+
+| Agent       | Port | Description          |
+|-------------|------|----------------------|
+| trail-agent | 8501 | Path & trail tracking |
+| trust-agent | 8502 | Trust scoring        |
+| compass-agent| 8503 | Direction & routing  |
+| echo-agent  | 8504 | Event echo           |
+| atlas-agent | 8505 | Mapping & geography  |
+| beacon-agent| 8506 | Signal broadcasting   |
+| scope-agent | 8507 | Observation & monitoring |
+| forge-agent | 8508 | Build & compilation   |
+| vault-agent | 8509 | Secret management     |
+| tide-agent  | 8510 | Temporal scheduling   |
+| helm-agent  | 8511 | Orchestration         |
+| crest-agent | 8512 | Wave analysis         |
 
 ## Configuration
 
-The runtime reads `fleet.yaml` (or `~/.superinstance/fleet.yaml`). A default is auto-generated on first boot.
+Edit `fleet.yaml` to customize ports, enable/disable agents, and tune health check intervals. The runtime generates sensible defaults if no config file is found.
 
-Key sections:
-- **runtime** — headless mode, log level, health check intervals
-- **keeper** — host, port, vault path
-- **git_agent** — host, port, workshop path
-- **agents** — list of fleet agents with ports, modes, branches
-- **mud** — MUD server settings
-- **network** — topology (star/mesh), discovery
-- **secrets** — environment variable names (never raw values)
+## Make Targets
 
-Environment variables override config:
-- `SUPERZ_HEADLESS=true`
-- `SUPERZ_LOG_LEVEL=DEBUG`
-- `KEEPER_PORT=8443`
-- `SUPERZ_SKIP_MUD=true`
-
-## Ports
-
-| Service | Port |
-|---|---|
-| Keeper Agent | 8443 |
-| Git Agent | 8444 |
-| Trail Agent | 8501 |
-| Trust Agent | 8502 |
-| Flux VM Agent | 8503 |
-| Knowledge Agent | 8504 |
-| Scheduler Agent | 8505 |
-| Edge Relay | 8506 |
-| Liaison Agent | 8507 |
-| Cartridge Agent | 8508 |
-| Holodeck MUD | 7777 |
-
-## File Structure
-
-```
-superz-runtime/
-├── __main__.py          # Package entry point
-├── runtime.py           # Main runtime engine (~500 lines)
-├── config.py            # Unified fleet config (~250 lines)
-├── process_manager.py   # Fleet process manager (~300 lines)
-├── health_monitor.py    # Fleet health aggregation (~250 lines)
-├── agent_launcher.py    # Agent launch logic (~200 lines)
-├── _agent_stub.py       # Lightweight placeholder for missing agents
-├── fleet.yaml           # Default fleet configuration
-├── pyproject.toml       # Package config
-├── Dockerfile           # Docker container
-├── docker-compose.yaml  # Full fleet stack
-├── Makefile             # Quick commands
-├── README.md            # This file
-└── tests/
-    └── test_runtime.py  # Comprehensive test suite
-```
-
-## Instance Directory
-
-All runtime state lives in `~/.superinstance/`:
-
-```
-~/.superinstance/
-├── fleet.yaml           # Active configuration
-├── superz_runtime.pid   # Runtime PID file
-├── agents/              # Cloned agent repos
-│   ├── trail-agent/
-│   ├── trust-agent/
-│   └── ...
-├── logs/                # Agent stdout/stderr logs
-├── vault/               # Keeper vault
-├── workshop/            # Git agent workshop
-└── worlds/              # MUD world files
+```bash
+make boot            # Start with TUI
+make boot-headless   # Start in daemon mode
+make stop            # Kill all fleet processes
+make status          # Check which ports are listening
+make doctor          # Verify environment
+make clean           # Remove ~/.superinstance
+make test            # Run test suite
 ```
 
 ## Requirements
 
-- **Python 3.10+**
-- **git** (for cloning agents)
-- **gh CLI** (optional, for GitHub API features)
-- **PyYAML** (`pip install pyyaml`)
+- Python 3.10+
+- git
+- PyYAML (`pip install pyyaml`)
 
 ## License
 

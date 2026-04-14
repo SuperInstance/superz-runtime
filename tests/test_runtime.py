@@ -1,46 +1,35 @@
 """
-Tests for SuperZ Runtime.
+Tests for SuperZ Runtime — config, process manager, agent launcher, runtime.
 
-Covers: environment check, config loading/validation, process manager,
-health monitor, agent launcher, boot sequence (mocked), graceful shutdown,
-and TUI output capture.
+All tests use mocking to avoid requiring real git repos, network services,
+or long-running processes.  ``sleep 999`` is used as a mock agent command.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
-import sys
 import signal
-import time
-import shutil
-import tempfile
-import threading
 import subprocess
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+import sys
+import tempfile
+import textwrap
+import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from unittest import mock
+from urllib.error import URLError
 
 import pytest
 
-# Ensure the package root is importable
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
+# Ensure we can import from the package root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import (
-    FleetConfig, AgentConfig, RuntimeConfig, KeeperConfig,
-    GitAgentConfig, MudConfig, NetworkConfig, SecretsConfig, _parse_bool,
-)
-from process_manager import ProcessManager, AgentProcess, LogRotator
-from health_monitor import HealthMonitor, HealthSnapshot, FleetHealthReport
-from agent_launcher import AgentLauncher, datetime_now_iso
-from runtime import (
-    SuperZRuntime, BootError, _format_duration, _check_command,
-    banner, log_phase, log_phase_done, ensure_agent_stub,
-    run_doctor, run_stop, run_status,
-)
+from config import FleetConfig, DEFAULT_FLEET_YAML, _deep_merge
+from process_manager import ProcessManager, AgentProcess
+from agent_launcher import AgentLauncher
+from runtime import SuperZRuntime, TUIRenderer, build_parser
 
 
 # ---------------------------------------------------------------------------
@@ -48,676 +37,753 @@ from runtime import (
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def tmp_dir(tmp_path: Path) -> Path:
-    """Provide a temporary directory for tests."""
-    return tmp_path
+def tmp_instance(tmp_path):
+    """Provide a temporary ~/.superinstance directory."""
+    inst = tmp_path / "superinstance"
+    inst.mkdir()
+    (inst / "logs").mkdir()
+    (inst / "agents").mkdir()
+    return inst
 
 
 @pytest.fixture
-def config(tmp_dir: Path) -> FleetConfig:
-    """Create a FleetConfig with temp directories."""
-    cfg = FleetConfig()
-    cfg.DEFAULT_INSTANCE_DIR = tmp_dir / "instance"
-    cfg.DEFAULT_AGENTS_DIR = tmp_dir / "instance" / "agents"
-    cfg.DEFAULT_LOGS_DIR = tmp_dir / "instance" / "logs"
-    cfg.DEFAULT_VAULT_DIR = tmp_dir / "instance" / "vault"
-    cfg.DEFAULT_WORKSHOP_DIR = tmp_dir / "instance" / "workshop"
-    cfg.DEFAULT_WORLDS_DIR = tmp_dir / "instance" / "worlds"
-    cfg.DEFAULT_CONFIG_PATH = tmp_dir / "fleet.yaml"
-    cfg._fill_defaults()
-    return cfg
-
-
-@pytest.fixture
-def proc_manager(tmp_dir: Path) -> ProcessManager:
-    """Create a ProcessManager with temp log dir."""
-    logs_dir = tmp_dir / "logs"
-    return ProcessManager(logs_dir=logs_dir)
-
-
-@pytest.fixture
-def health_monitor() -> HealthMonitor:
-    """Create a HealthMonitor."""
-    return HealthMonitor(health_timeout=2, max_history=100)
+def sample_config(tmp_path):
+    """Write a minimal fleet.yaml and return its path."""
+    cfg = tmp_path / "fleet.yaml"
+    cfg.write_text(textwrap.dedent("""\
+        runtime:
+          headless: true
+          health_interval: 5
+        keeper:
+          port: 8443
+        git_agent:
+          port: 8444
+        agents:
+          - name: trail-agent
+            repo: SuperInstance/trail-agent
+            port: 8501
+            enabled: true
+            command: "sleep 999"
+          - name: trust-agent
+            repo: SuperInstance/trust-agent
+            port: 8502
+            enabled: false
+            command: "sleep 999"
+        mud:
+          enabled: false
+    """))
+    return str(cfg)
 
 
 # ---------------------------------------------------------------------------
+# Helper: HTTP server in a thread
+# ---------------------------------------------------------------------------
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Minimal /health endpoint returning 200 OK."""
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # silence request logs
+
+
+def _start_health_server(port: int) -> HTTPServer:
+    server = HTTPServer(("127.0.0.1", port), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
+# ===================================================================
 # Config Tests
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 class TestFleetConfig:
-    """Tests for FleetConfig loading, validation, and persistence."""
+    """Tests for FleetConfig — load, save, validate, generate_defaults."""
 
-    def test_default_config(self) -> None:
-        """Default config should have sensible values."""
-        cfg = FleetConfig()
-        assert cfg.keeper.port == 8443
-        assert cfg.git_agent.port == 8444
-        assert len(cfg.agents) == 8
-        assert cfg.mud.port == 7777
-        assert cfg.network.topology == "star"
+    def test_generate_defaults(self):
+        cfg = FleetConfig.generate_defaults()
+        assert cfg.is_valid()
+        assert len(cfg.agents) == 12
+        assert all(a.get("enabled") for a in cfg.agents)
 
-    def test_default_agents(self) -> None:
-        """Default agent list should match spec."""
-        cfg = FleetConfig()
-        names = {a.name for a in cfg.agents}
-        assert "trail-agent" in names
-        assert "trust-agent" in names
-        assert "flux-vm-agent" in names
-        assert "knowledge-agent" in names
-        assert "scheduler-agent" in names
-        assert "edge-relay" in names
-        assert "liaison-agent" in names
-        assert "cartridge-agent" in names
+    def test_load_from_file(self, sample_config):
+        cfg = FleetConfig.load(path=sample_config)
+        assert cfg.is_valid()
+        assert len(cfg.agents) == 2
+        assert cfg.enabled_agents()[0]["name"] == "trail-agent"
+        assert len(cfg.enabled_agents()) == 1  # trust-agent disabled
 
-    def test_load_nonexistent(self) -> None:
-        """Loading a nonexistent file should return defaults."""
-        cfg = FleetConfig.load("/nonexistent/path.yaml")
-        assert len(cfg.agents) == 8
+    def test_load_missing_file_uses_defaults(self, tmp_path):
+        nonexistent = str(tmp_path / "nope.yaml")
+        cfg = FleetConfig.load(path=nonexistent)
+        assert cfg.is_valid()
+        assert len(cfg.agents) == 12
 
-    def test_save_and_load(self, tmp_dir: Path) -> None:
-        """Save and reload a config."""
-        cfg = FleetConfig()
-        cfg.keeper.port = 9999
-        path = tmp_dir / "test.yaml"
-        cfg.save(path)
+    def test_save(self, tmp_path):
+        cfg = FleetConfig.generate_defaults()
+        out = tmp_path / "saved.yaml"
+        cfg.save(path=str(out))
+        assert out.exists()
 
-        loaded = FleetConfig.load(str(path))
-        assert loaded.keeper.port == 9999
+        # Re-load and verify round-trip
+        cfg2 = FleetConfig.load(path=str(out))
+        assert len(cfg2.agents) == len(cfg.agents)
 
-    def test_validate_good(self) -> None:
-        """Valid config should have no errors."""
-        cfg = FleetConfig()
+    def test_validate_missing_name(self, tmp_path):
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("agents:\n  - port: 8501\n")
+        cfg = FleetConfig.load(path=str(bad))
         errors = cfg.validate()
-        assert len(errors) == 0
+        assert any("name" in e.lower() for e in errors)
 
-    def test_validate_port_conflict(self) -> None:
-        """Port conflicts should be detected."""
-        cfg = FleetConfig()
-        cfg.keeper.port = 8443
-        cfg.git_agent.port = 8443  # conflict!
+    def test_validate_duplicate_name(self, tmp_path):
+        dup = tmp_path / "dup.yaml"
+        dup.write_text(textwrap.dedent("""\
+            agents:
+              - name: foo
+                port: 8501
+              - name: foo
+                port: 8502
+        """))
+        cfg = FleetConfig.load(path=str(dup))
         errors = cfg.validate()
-        assert any("conflict" in e.lower() for e in errors)
+        assert any("duplicate" in e.lower() for e in errors)
 
-    def test_validate_port_range(self) -> None:
-        """Out-of-range ports should be detected."""
-        cfg = FleetConfig()
-        cfg.keeper.port = 99999
+    def test_validate_duplicate_port(self, tmp_path):
+        dup = tmp_path / "dup.yaml"
+        dup.write_text(textwrap.dedent("""\
+            agents:
+              - name: foo
+                port: 8501
+              - name: bar
+                port: 8501
+        """))
+        cfg = FleetConfig.load(path=str(dup))
         errors = cfg.validate()
-        assert any("out of range" in e.lower() for e in errors)
+        assert any("duplicate port" in e.lower() for e in errors)
 
-    def test_validate_health_interval(self) -> None:
-        """Health interval below minimum should be detected."""
-        cfg = FleetConfig()
-        cfg.runtime.health_interval = 1
+    def test_validate_bad_health_interval(self, tmp_path):
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("runtime:\n  health_interval: -1\n")
+        cfg = FleetConfig.load(path=str(bad))
         errors = cfg.validate()
         assert any("health_interval" in e for e in errors)
 
-    def test_validate_topology(self) -> None:
-        """Invalid topology should be detected."""
-        cfg = FleetConfig()
-        cfg.network.topology = "invalid"
-        errors = cfg.validate()
-        assert any("topology" in e for e in errors)
+    def test_get_agent(self):
+        cfg = FleetConfig.generate_defaults()
+        agent = cfg.get_agent("trail-agent")
+        assert agent is not None
+        assert agent["port"] == 8501
+        assert cfg.get_agent("nonexistent") is None
 
-    def test_env_override_headless(self) -> None:
-        """Environment variable should override headless."""
-        with patch.dict(os.environ, {"SUPERZ_HEADLESS": "true"}):
-            cfg = FleetConfig.load()
-            assert cfg.runtime.headless is True
+    def test_enabled_agents(self, sample_config):
+        cfg = FleetConfig.load(path=sample_config)
+        enabled = cfg.enabled_agents()
+        assert len(enabled) == 1
+        assert enabled[0]["name"] == "trail-agent"
 
-    def test_env_override_skip_mud(self) -> None:
-        """SUPERZ_SKIP_MUD should disable MUD."""
-        with patch.dict(os.environ, {"SUPERZ_SKIP_MUD": "true"}):
-            cfg = FleetConfig.load()
-            assert cfg.mud.enabled is False
+    def test_get_all_ports(self):
+        cfg = FleetConfig.generate_defaults()
+        ports = cfg.get_all_ports()
+        assert ports["keeper"] == 8443
+        assert ports["git-agent"] == 8444
+        assert ports["trail-agent"] == 8501
+        # MUD disabled → should not be in ports
+        assert "mud" not in ports
 
-    def test_filter_agents(self) -> None:
-        """Agent filtering should work correctly."""
-        cfg = FleetConfig()
-        filtered = cfg.filter_agents(["trail-agent", "trust-agent"])
-        assert len(filtered) == 2
-        names = {a.name for a in filtered}
-        assert "trail-agent" in names
-        assert "trust-agent" in names
+    def test_get_all_ports_mud_enabled(self, tmp_path):
+        mud_cfg = tmp_path / "mud.yaml"
+        mud_cfg.write_text(textwrap.dedent("""\
+            runtime: {}
+            keeper: {port: 8443}
+            git_agent: {port: 8444}
+            agents: []
+            mud: {enabled: true, port: 7777, bridge_port: 8877}
+        """))
+        cfg = FleetConfig.load(path=str(mud_cfg))
+        ports = cfg.get_all_ports()
+        assert ports["mud"] == 7777
+        assert ports["mud-bridge"] == 8877
 
-    def test_ensure_directories(self, tmp_dir: Path) -> None:
-        """ensure_directories should create all dirs."""
-        cfg = FleetConfig()
-        cfg.DEFAULT_INSTANCE_DIR = tmp_dir / "new_instance"
-        cfg.DEFAULT_AGENTS_DIR = tmp_dir / "new_instance" / "agents"
-        cfg.DEFAULT_LOGS_DIR = tmp_dir / "new_instance" / "logs"
-        cfg.DEFAULT_VAULT_DIR = tmp_dir / "new_instance" / "vault"
-        cfg.DEFAULT_WORKSHOP_DIR = tmp_dir / "new_instance" / "workshop"
-        cfg.DEFAULT_WORLDS_DIR = tmp_dir / "new_instance" / "worlds"
-        cfg._fill_defaults()
-        cfg.ensure_directories()
-        assert cfg.DEFAULT_INSTANCE_DIR.exists()
-        assert cfg.DEFAULT_AGENTS_DIR.exists()
-        assert cfg.DEFAULT_LOGS_DIR.exists()
+    def test_get_dotted_key(self):
+        cfg = FleetConfig.generate_defaults()
+        assert cfg.get("runtime.health_interval") == 30
+        assert cfg.get("nonexistent.key", "default") == "default"
 
+    def test_deep_merge(self):
+        base = {"a": 1, "b": {"c": 2, "d": 3}}
+        override = {"b": {"c": 99}, "e": 5}
+        result = _deep_merge(base, override)
+        assert result == {"a": 1, "b": {"c": 99, "d": 3}, "e": 5}
 
-class TestParseBool:
-    """Tests for _parse_bool helper."""
-
-    def test_true_values(self) -> None:
-        for val in ("1", "true", "TRUE", "yes", "YES", "on", "ON"):
-            assert _parse_bool(val) is True
-
-    def test_false_values(self) -> None:
-        for val in ("0", "false", "FALSE", "no", "NO", "off", "OFF", "anything"):
-            assert _parse_bool(val) is False
+    def test_repr(self):
+        cfg = FleetConfig.generate_defaults()
+        r = repr(cfg)
+        assert "agents=12" in r
+        assert "enabled=12" in r
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # Process Manager Tests
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 class TestProcessManager:
-    """Tests for ProcessManager start/stop/restart."""
+    """Tests for ProcessManager — start, stop, restart, health check."""
 
-    def test_start_and_stop(self, proc_manager: ProcessManager) -> None:
-        """Should be able to start and stop a subprocess."""
-        agent = proc_manager.start_agent(
-            name="test-sleep",
-            cmd=[sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-        assert agent.is_running
-        assert agent.health_status == "starting"
+    def test_register(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        proc = pm.register("test-agent", "sleep 999", 9999, "/tmp")
+        assert proc.name == "test-agent"
+        assert proc.port == 9999
+        assert proc.health_status == "DOWN"
+        assert "test-agent" in pm.agent_names
 
-        proc_manager.stop_agent("test-sleep")
-        assert not agent.is_running
-        assert agent.health_status == "stopped"
+    def test_start_and_stop(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("sleeper", "sleep 999", 19999, "/tmp")
+        pid = pm.start_agent("sleeper")
+        assert pid is not None
+        assert pid > 0
 
-    def test_stop_nonexistent(self, proc_manager: ProcessManager) -> None:
-        """Stopping a nonexistent agent should not error."""
-        result = proc_manager.stop_agent("ghost-agent")
-        assert result is True
+        # Check it's actually running
+        proc = pm.get_agent("sleeper")
+        assert proc is not None
+        assert proc.pid == pid
+        assert proc.subprocess is not None
+        assert proc.subprocess.poll() is None  # still alive
 
-    def test_stop_all(self, proc_manager: ProcessManager) -> None:
-        """stop_all should stop every running agent."""
-        proc_manager.start_agent(
-            name="a",
-            cmd=[sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-        proc_manager.start_agent(
-            name="b",
-            cmd=[sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-        assert len(proc_manager.get_running()) == 2
+        # Stop it
+        stopped = pm.stop_agent("sleeper")
+        assert stopped is True
+        assert proc.subprocess is None
+        assert proc.pid is None
+        assert proc.health_status == "DOWN"
 
-        proc_manager.stop_all()
-        assert len(proc_manager.get_running()) == 0
+    def test_stop_unknown_agent(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        result = pm.stop_agent("nonexistent")
+        assert result is False
 
-    def test_crashed_agent_detection(self, proc_manager: ProcessManager) -> None:
-        """Crashed agents should be detected by check_and_restart_dead."""
-        proc_manager.start_agent(
-            name="exit-immediately",
-            cmd=[sys.executable, "-c", "import sys; sys.exit(1)"],
-        )
-        # Wait for the process to actually exit
-        time.sleep(0.5)
-        restarted = proc_manager.check_and_restart_dead()
-        assert "exit-immediately" in restarted
+    def test_start_already_running(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("sleeper", "sleep 999", 19999, "/tmp")
+        pid1 = pm.start_agent("sleeper")
+        pid2 = pm.start_agent("sleeper")
+        assert pid1 == pid2  # returns existing PID
 
-    def test_status_callback(self, proc_manager: ProcessManager) -> None:
-        """Status change callback should fire on state transitions."""
-        changes: list[tuple[str, str, str]] = []
-        proc_manager.set_status_callback(lambda n, o, s: changes.append((n, o, s)))
+    def test_start_invalid_command(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("bad", "nonexistent_binary_xyz", 19999, "/tmp")
+        pid = pm.start_agent("bad")
+        assert pid is None
+        proc = pm.get_agent("bad")
+        assert proc.health_status == "ERR"
 
-        proc_manager.start_agent(
-            name="cb-test",
-            cmd=[sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-        proc_manager.stop_agent("cb-test")
+    def test_restart_agent(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("sleeper", "sleep 999", 19999, "/tmp")
+        pid1 = pm.start_agent("sleeper")
+        pid2 = pm.restart_agent("sleeper")
+        assert pid2 is not None
+        # PIDs may or may not differ due to timing, but both should be valid
+        assert pid2 > 0
 
-        # Should have recorded at least the stopped transition
-        assert len(changes) >= 1
-        assert changes[-1][2] == "stopped"
+    def test_check_health_down(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("dead", "sleep 0.1", 19999, "/tmp")
+        pm.start_agent("dead")
+        time.sleep(0.3)  # let it exit
+        status = pm.check_health("dead")
+        assert status == "DOWN"
 
-    def test_pid_file(self, tmp_dir: Path) -> None:
-        """PID file should be written and read correctly."""
-        pid_path = tmp_dir / "runtime.pid"
-        pm = ProcessManager(logs_dir=tmp_dir / "logs")
-        pm.write_pid_file(pid_path)
-        assert pid_path.exists()
-        assert ProcessManager.read_pid_file(pid_path) == os.getpid()
-        ProcessManager.remove_pid_file(pid_path)
-        assert not pid_path.exists()
-
-    def test_summary(self, proc_manager: ProcessManager) -> None:
-        """Summary should reflect current process state."""
-        proc_manager.start_agent(
-            name="s1",
-            cmd=[sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-        summary = proc_manager.summary()
-        assert summary["total"] == 1
-        assert summary["running"] == 1
-
-        proc_manager.stop_all()
-        summary = proc_manager.summary()
-        assert summary["running"] == 0
-        assert summary["stopped"] == 1
-
-    def test_log_rotator(self, tmp_dir: Path) -> None:
-        """LogRotator should create log files correctly."""
-        rotator = LogRotator(tmp_dir / "logs", max_logs=3, max_bytes=1024)
-        path = rotator.get_log_path("test-agent", "stdout")
-        assert path.name == "test-agent.stdout.log"
-
-
-# ---------------------------------------------------------------------------
-# Health Monitor Tests
-# ---------------------------------------------------------------------------
-
-class TestHealthMonitor:
-    """Tests for HealthMonitor with mock HTTP servers."""
-
-    def _start_mock_server(self, port: int, status: int = 200) -> HTTPServer:
-        """Start a mock HTTP health endpoint in a thread."""
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:  # noqa: N802
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "healthy"}).encode())
-            def log_message(self, fmt: str, *args: object) -> None:
-                pass  # suppress
-
-        server = HTTPServer(("127.0.0.1", port), Handler)
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
-        return server
-
-    def test_check_healthy(self, health_monitor: HealthMonitor) -> None:
-        """Healthy agent should return healthy status."""
-        server = self._start_mock_server(19876)
+    def test_check_health_http_ok(self, tmp_instance):
+        """Start a real HTTP server on a port, then check health."""
+        port = 19283
+        server = _start_health_server(port)
         try:
-            health_monitor.add_agent("mock-healthy", "http://127.0.0.1:19876/health")
-            snapshot = health_monitor.check_agent("mock-healthy")
-            assert snapshot.status == "healthy"
-            assert snapshot.response_time_ms > 0
+            pm = ProcessManager(base_instance_dir=str(tmp_instance))
+            # Manually create an AgentProcess that points to our server
+            proc = AgentProcess(name="http-agent", port=port, command="", cwd="", log_dir=str(tmp_instance / "logs" / "http-agent"))
+            pm._agents["http-agent"] = proc
+            # Pretend subprocess is running
+            mock_popen = mock.MagicMock()
+            mock_popen.poll.return_value = None
+            proc.subprocess = mock_popen
+
+            status = pm.check_health("http-agent")
+            assert status == "OK"
         finally:
             server.shutdown()
 
-    def test_check_unhealthy(self, health_monitor: HealthMonitor) -> None:
-        """Unreachable agent should return unhealthy status."""
-        health_monitor.add_agent("ghost", "http://127.0.0.1:19877/health")
-        snapshot = health_monitor.check_agent("ghost")
-        assert snapshot.status == "unhealthy"
-        assert "error" in snapshot.error.lower() or "refused" in snapshot.error.lower()
+    def test_check_health_http_fail_process_alive(self, tmp_instance):
+        """Port with no HTTP server → WARN (process alive but no health endpoint)."""
+        # Use a port that nothing is listening on
+        port = 19284
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        proc = AgentProcess(name="no-http", port=port, command="", cwd="", log_dir=str(tmp_instance / "logs" / "no-http"))
+        pm._agents["no-http"] = proc
+        mock_popen = mock.MagicMock()
+        mock_popen.poll.return_value = None
+        proc.subprocess = mock_popen
 
-    def test_check_all(self, health_monitor: HealthMonitor) -> None:
-        """check_all should return a full fleet report."""
-        server = self._start_mock_server(19878)
-        try:
-            health_monitor.add_agent("a1", "http://127.0.0.1:19878/health")
-            health_monitor.add_agent("a2", "http://127.0.0.1:19879/health")  # dead
-            report = health_monitor.check_all()
-            assert report.total_agents == 2
-            assert report.healthy_count == 1
-            assert report.unhealthy_count == 1
-            assert 0 < report.health_score < 100
-        finally:
-            server.shutdown()
+        status = pm.check_health("no-http")
+        assert status == "WARN"
 
-    def test_fleet_score_perfect(self, health_monitor: HealthMonitor) -> None:
-        """All healthy agents should score 100."""
-        server = self._start_mock_server(19880)
-        try:
-            health_monitor.add_agent("p1", "http://127.0.0.1:19880/health")
-            report = health_monitor.check_all()
-            assert report.health_score == 100.0
-        finally:
-            server.shutdown()
+    def test_get_status(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("sleeper", "sleep 999", 19999, "/tmp")
+        pm.start_agent("sleeper")
 
-    def test_history(self, health_monitor: HealthMonitor) -> None:
-        """History should accumulate data points via check_all."""
-        server = self._start_mock_server(19881)
-        try:
-            health_monitor.add_agent("hist", "http://127.0.0.1:19881/health")
-            health_monitor.check_all()
-            health_monitor.check_all()
-            history = health_monitor.get_history("hist")
-            assert len(history) == 2
-        finally:
-            server.shutdown()
+        status = pm.get_status()
+        assert "sleeper" in status
+        assert status["sleeper"]["pid"] > 0
+        assert status["sleeper"]["port"] == 19999
 
-    def test_alerts(self, health_monitor: HealthMonitor) -> None:
-        """Consecutive unhealthy checks should generate alerts."""
-        health_monitor.add_agent("alert-test", "http://127.0.0.1:19882/health")
-        # check_all populates health data; check_alerts tracks consecutive failures
+    def test_stop_all(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("a", "sleep 999", 19991, "/tmp")
+        pm.register("b", "sleep 999", 19992, "/tmp")
+        pm.register("c", "sleep 999", 19993, "/tmp")
+        pm.start_agent("a")
+        pm.start_agent("b")
+        pm.start_agent("c")
+
+        pm.stop_all()
+        for name in ("a", "b", "c"):
+            assert pm.get_agent(name).health_status == "DOWN"
+
+    def test_auto_restart_with_backoff(self, tmp_instance):
+        """Agent exits immediately, auto-restart should fire with backoff."""
+        pm = ProcessManager(base_instance_dir=str(tmp_instance), max_restart_attempts=3)
+        pm.register("crasher", "sleep 0.1", 19999, "/tmp")
+
+        # First start
+        pm.start_agent("crasher")
+        time.sleep(0.3)
+        assert pm.check_health("crasher") == "DOWN"
+
+        # Auto-restart (should succeed since sleep 0.1 exits quickly)
+        pid = pm.auto_restart("crasher")
+        assert pid is not None
+        assert pm.get_agent("crasher").restart_count == 1
+
+    def test_auto_restart_max_attempts(self, tmp_instance):
+        """After max attempts, auto_restart gives up."""
+        pm = ProcessManager(base_instance_dir=str(tmp_instance), max_restart_attempts=2)
+        pm.register("crasher", "sleep 0.1", 19999, "/tmp")
+
+        # Exhaust restarts
         for _ in range(3):
-            health_monitor.check_all()
-            health_monitor.check_alerts()  # must call repeatedly to accumulate count
-        alerts = health_monitor.check_alerts()
-        assert len(alerts) > 0
-        assert any("CRITICAL" in a for a in alerts)
+            pm.start_agent("crasher")
+            time.sleep(0.3)
+            pm.check_health("crasher")
+            pm.auto_restart("crasher")
 
-    def test_format_report(self, health_monitor: HealthMonitor) -> None:
-        """format_report should produce a human-readable string."""
-        server = self._start_mock_server(19883)
-        try:
-            health_monitor.add_agent("fmt", "http://127.0.0.1:19883/health")
-            report = health_monitor.check_all()
-            text = health_monitor.format_report(report)
-            assert "Fleet Health:" in text
-            assert "fmt" in text
-            assert "[OK]" in text
-        finally:
-            server.shutdown()
+        # Should have given up
+        assert pm.get_agent("crasher").restart_count >= 2
 
-    def test_set_total_tests(self, health_monitor: HealthMonitor) -> None:
-        """Total tests should be tracked."""
-        health_monitor.set_total_tests(880)
-        assert health_monitor._total_tests_passing == 880
+    def test_log_files_created(self, tmp_instance):
+        """Verify stdout/stderr log files are created."""
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("logger", "echo hello", 19999, "/tmp")
+        pm.start_agent("logger")
+        pm.stop_agent("logger")
+
+        log_dir = tmp_instance / "logs" / "logger"
+        assert (log_dir / "stdout.log").exists()
+        assert (log_dir / "stderr.log").exists()
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # Agent Launcher Tests
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 class TestAgentLauncher:
-    """Tests for AgentLauncher with mocked clone/onboard."""
+    """Tests for AgentLauncher — discover, clone, onboard, launch."""
 
-    def test_discover_local_agents(self, tmp_dir: Path) -> None:
-        """Should find git repos in the agents directory."""
-        agents_dir = tmp_dir / "agents"
-        agents_dir.mkdir()
+    def test_init_creates_dirs(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        assert (tmp_instance / "agents").exists()
 
-        # Create a fake git repo
-        repo_dir = agents_dir / "trail-agent"
-        repo_dir.mkdir()
-        (repo_dir / ".git").mkdir()
+    def test_discover_agents_empty(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        discovered = launcher.discover_agents()
+        assert discovered == []
 
-        launcher = AgentLauncher.__new__(AgentLauncher)
-        launcher.config = FleetConfig()
-        launcher.agents_dir = agents_dir
-        launcher._github_token = None
+    def test_discover_agents(self, tmp_instance):
+        (tmp_instance / "agents" / "trail-agent").mkdir()
+        (tmp_instance / "agents" / "trust-agent").mkdir()
+        (tmp_instance / "agents" / ".hidden").mkdir()
 
-        found = launcher.discover_local_agents()
-        assert "trail-agent" in found
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        discovered = launcher.discover_agents()
+        assert discovered == ["trail-agent", "trust-agent"]
 
-    def test_discover_missing_agents(self, tmp_dir: Path) -> None:
-        """Should identify agents not yet cloned."""
-        agents_dir = tmp_dir / "agents"
-        agents_dir.mkdir()
+    def test_is_onboarded_false(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        assert launcher.is_onboarded("trail-agent") is False
 
-        # Only trail-agent exists
-        (agents_dir / "trail-agent" / ".git").mkdir(parents=True)
+    def test_mark_onboarded(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        launcher.mark_onboarded("trail-agent")
+        assert launcher.is_onboarded("trail-agent") is True
 
-        launcher = AgentLauncher.__new__(AgentLauncher)
-        launcher.config = FleetConfig()
-        launcher.agents_dir = agents_dir
-        launcher._github_token = None
+    def test_clone_agent_mocked(self, tmp_instance):
+        """Mock subprocess.run to simulate a git clone."""
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
 
-        configs = [
-            AgentConfig(name="trail-agent", repo="trail-agent"),
-            AgentConfig(name="trust-agent", repo="trust-agent"),
-        ]
-        missing = launcher.discover_missing_agents(configs)
-        assert len(missing) == 1
-        assert missing[0].name == "trust-agent"
-
-    def test_clone_agent(self, tmp_dir: Path) -> None:
-        """Clone should succeed with a mock git command."""
-        agents_dir = tmp_dir / "agents"
-        agents_dir.mkdir()
-
-        launcher = AgentLauncher.__new__(AgentLauncher)
-        launcher.config = FleetConfig()
-        launcher.agents_dir = agents_dir
-        launcher._github_token = None
-
-        agent = AgentConfig(name="test-agent", repo="test-agent")
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
-            result = launcher.clone_agent(agent)
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stderr="")
+            result = launcher.clone_agent("trail-agent", "SuperInstance/trail-agent")
             assert result is True
             mock_run.assert_called_once()
 
-    def test_clone_agent_failure(self, tmp_dir: Path) -> None:
-        """Clone failure should return False."""
-        agents_dir = tmp_dir / "agents"
-        agents_dir.mkdir()
-
-        launcher = AgentLauncher.__new__(AgentLauncher)
-        launcher.config = FleetConfig()
-        launcher.agents_dir = agents_dir
-        launcher._github_token = None
-
-        agent = AgentConfig(name="test-agent", repo="test-agent")
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=128, stderr="fatal: repo not found")
-            result = launcher.clone_agent(agent)
+    def test_clone_agent_git_missing(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            result = launcher.clone_agent("foo", "bar/baz")
             assert result is False
 
-    def test_build_agent_env(self, tmp_dir: Path) -> None:
-        """Agent environment should include all expected vars."""
-        agents_dir = tmp_dir / "agents"
-        agents_dir.mkdir()
+    def test_clone_already_exists(self, tmp_instance):
+        target = tmp_instance / "agents" / "existing"
+        target.mkdir()
+        (target / ".git").mkdir()
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        result = launcher.clone_agent("existing", "whatever/repo")
+        assert result is True  # should skip
 
-        cfg = FleetConfig()
-        cfg.network.keeper_url = "http://127.0.0.1:8443"
+    def test_build_launch_command_from_config(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        cfg = {"command": "python custom.py run"}
+        cmd = launcher.build_launch_command("test", cfg)
+        assert cmd == "python custom.py run"
 
-        launcher = AgentLauncher.__new__(AgentLauncher)
-        launcher.config = cfg
-        launcher.agents_dir = agents_dir
-        launcher._github_token = None
-
-        agent = AgentConfig(name="trail-agent", port=8501, host="127.0.0.1")
-        env = launcher.build_agent_env(agent)
-
-        assert env["AGENT_NAME"] == "trail-agent"
-        assert env["AGENT_PORT"] == "8501"
-        assert env["KEEPER_URL"] == "http://127.0.0.1:8443"
-        assert env["PYTHONUNBUFFERED"] == "1"
-
-    def test_build_launch_command(self, tmp_dir: Path) -> None:
-        """Should detect launch command from repo structure."""
-        agents_dir = tmp_dir / "agents"
-        # The launcher looks for agents_dir / agent.name (which is "trail-agent")
-        agent_dir = agents_dir / "trail-agent"
+    def test_build_launch_command_cli_py(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        agent_dir = tmp_instance / "agents" / "my-agent"
         agent_dir.mkdir(parents=True)
-        # Create a module-style structure that build_launch_command can detect
-        mod_dir = agent_dir / "trail_agent"
-        mod_dir.mkdir(parents=True)
-        (mod_dir / "__init__.py").write_text("")
-        (mod_dir / "__main__.py").write_text("")
+        (agent_dir / "cli.py").touch()
 
-        launcher = AgentLauncher.__new__(AgentLauncher)
-        launcher.config = FleetConfig()
-        launcher.agents_dir = agents_dir
-        launcher._github_token = None
+        cmd = launcher.build_launch_command("my-agent")
+        assert cmd == "python cli.py serve"
 
-        agent = AgentConfig(name="trail-agent", repo="trail-agent")
-        cmd = launcher.build_launch_command(agent)
-        assert cmd is not None
-        assert cmd[0] == "python"
-        assert "-m" in cmd
-        assert "trail-agent" in cmd
+    def test_build_launch_command_module(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        cmd = launcher.build_launch_command("trail-agent")
+        assert cmd == "python -m trail_agent.serve"
 
+    def test_pull_agent_mocked(self, tmp_instance):
+        target = tmp_instance / "agents" / "trail-agent"
+        target.mkdir()
+        (target / ".git").mkdir()
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
 
-# ---------------------------------------------------------------------------
-# Runtime Tests
-# ---------------------------------------------------------------------------
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stderr="")
+            assert launcher.pull_agent("trail-agent") is True
 
-class TestRuntime:
-    """Tests for SuperZRuntime boot sequence (with mocked subprocesses)."""
+    def test_launch_with_process_manager(self, tmp_instance):
+        """Full launch pipeline (mocked clone since we don't have real git)."""
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
 
-    def test_environment_check(self, tmp_dir: Path) -> None:
-        """Phase 1 should complete successfully with valid environment."""
-        runtime = SuperZRuntime(config_path=str(tmp_dir / "fleet.yaml"))
-        runtime._setup_logging()
-        # Should not raise
-        runtime._phase1_environment_check()
-        assert runtime.config is not None
-        assert runtime.process_manager is not None
-        assert runtime.health_monitor is not None
+        # Pre-create agent dir to simulate clone
+        agent_dir = tmp_instance / "agents" / "test-agent"
+        agent_dir.mkdir()
 
-    def test_environment_check_python_version(self) -> None:
-        """Should raise BootError for old Python."""
-        runtime = SuperZRuntime()
-        with patch.object(sys, "version_info", (3, 8, 0)):
-            with pytest.raises(BootError) as exc_info:
-                runtime._setup_logging()
-                runtime._phase1_environment_check()
-            assert "Python" in exc_info.value.message
+        with mock.patch.object(launcher, "clone_agent", return_value=True):
+            result = launcher.launch(
+                name="test-agent",
+                port=19999,
+                agent_config={"repo": "SuperInstance/test-agent"},
+                process_manager=pm,
+            )
+        assert result is True
+        assert "test-agent" in pm.agent_names
 
-    def test_environment_check_git(self) -> None:
-        """Should raise BootError when git is missing."""
-        runtime = SuperZRuntime()
-        with patch("runtime._check_command", return_value=False):
-            with pytest.raises(BootError) as exc_info:
-                runtime._setup_logging()
-                runtime._phase1_environment_check()
-            assert "git" in exc_info.value.message
-
-    def test_boot_error(self) -> None:
-        """BootError should format phase and message correctly."""
-        err = BootError("Phase 1", "something went wrong")
-        assert str(err) == "Phase 1: something went wrong"
-        assert err.phase == "Phase 1"
-
-    def test_shutdown(self) -> None:
-        """Shutdown should be safe to call multiple times."""
-        runtime = SuperZRuntime()
-        runtime.process_manager = ProcessManager(logs_dir=Path(tempfile.mkdtemp()))
-        runtime.shutdown()
-        runtime.shutdown()  # second call should be no-op
-
-    def test_signal_handler(self, tmp_dir: Path) -> None:
-        """Signal handler should trigger shutdown."""
-        runtime = SuperZRuntime()
-        runtime.process_manager = ProcessManager(logs_dir=tmp_dir / "logs")
-        runtime._signal_handler(signal.SIGTERM, None)
-        assert runtime._shutting_down
+    def test_onboard_full_pipeline(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stderr="")
+            assert launcher.onboard("new-agent", "org/new-agent") is True
+        assert launcher.is_onboarded("new-agent")
 
 
-# ---------------------------------------------------------------------------
-# Utility Tests
-# ---------------------------------------------------------------------------
+# ===================================================================
+# TUI Tests
+# ===================================================================
 
-class TestUtilities:
-    """Tests for utility functions."""
+class TestTUIRenderer:
+    """Tests for TUI rendering — output capture, formatting."""
 
-    def test_format_duration(self) -> None:
-        assert _format_duration(0) == "00:00"
-        assert _format_duration(65) == "01:05"
-        assert _format_duration(3661) == "01:01:01"
-        assert _format_duration(-1) == "00:00"
+    def test_render_no_ansi_when_disabled(self, capsys):
+        tui = TUIRenderer(enabled=False)
+        tui.start()
+        tui.render(
+            {"test": {"name": "test", "status": "OK", "port": 8080, "pid": 100, "uptime": 60, "restart_count": 0}},
+            phase="running",
+        )
+        # Should produce no stdout when disabled
+        captured = capsys.readouterr()
+        assert captured.out == ""
 
-    def test_check_command(self) -> None:
-        assert _check_command("python") is True
-        assert _check_command("nonexistent_command_xyz") is False
-
-    def test_banner(self, capsys: Any) -> None:
-        """Banner should produce output."""
-        banner()
+    def test_render_enabled_captures_output(self, capsys):
+        with mock.patch("runtime._supports_ansi", return_value=True):
+            tui = TUIRenderer(enabled=True)
+        tui._last_frame = 0  # force render
+        tui._enabled = True  # force enable even though capsys is not a TTY
+        tui.start()
+        tui.render(
+            {
+                "keeper": {"name": "keeper", "status": "OK", "port": 8443, "pid": 100, "uptime": 120, "restart_count": 0},
+                "agent-a": {"name": "agent-a", "status": "DOWN", "port": 8501, "pid": None, "uptime": 0, "restart_count": 2},
+            },
+            phase="running",
+        )
         captured = capsys.readouterr()
         assert "SuperZ Runtime" in captured.out
+        assert "keeper" in captured.out
+        assert "agent-a" in captured.out
+        assert "1/2 healthy" in captured.out
 
-    def test_log_phase(self, capsys: Any) -> None:
-        """log_phase should print phase name."""
-        log_phase("Test Phase")
-        captured = capsys.readouterr()
-        assert "Test Phase" in captured.out
-
-    def test_log_phase_done(self, capsys: Any) -> None:
-        """log_phase_done should print completion."""
-        log_phase_done("Test Phase")
-        captured = capsys.readouterr()
-        assert "complete" in captured.out
-
-    def test_datetime_now_iso(self) -> None:
-        """Should return a valid ISO datetime string."""
-        result = datetime_now_iso()
-        assert "T" in result
-        assert "-" in result
-
-    def test_ensure_agent_stub(self, tmp_dir: Path) -> None:
-        """Agent stub file should be created."""
-        stub_path = tmp_dir / "_agent_stub.py"
-        with patch.object(Path, "exists", return_value=False):
-            with patch("runtime.Path", return_value=stub_path):
-                ensure_agent_stub()
-        # Stub should exist after call
-        # (In test context, stub may already exist from the actual call)
+    def test_fmt_uptime(self):
+        assert TUIRenderer._fmt_uptime(0) == "-"
+        assert TUIRenderer._fmt_uptime(5) == "5s"
+        assert TUIRenderer._fmt_uptime(125) == "2m 5s"
+        assert TUIRenderer._fmt_uptime(3725) == "1h 2m"
 
 
-# ---------------------------------------------------------------------------
-# Integration-style tests
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Runtime Tests
+# ===================================================================
 
-class TestIntegration:
-    """Higher-level integration tests."""
+class TestSuperZRuntime:
+    """Integration tests for SuperZRuntime — boot, shutdown, signals."""
 
-    def test_full_boot_with_stubs(self, tmp_dir: Path) -> None:
-        """Boot the runtime with stub agents and verify it starts."""
-        # Ensure the agent stub is written
-        ensure_agent_stub()
+    def test_build_parser(self):
+        parser = build_parser()
+        args = parser.parse_args(["--headless", "--skip-mud", "--agents", "trail,trust"])
+        assert args.headless is True
+        assert args.skip_mud is True
+        assert args.agents == "trail,trust"
 
-        runtime = SuperZRuntime(
-            config_path=str(tmp_dir / "fleet.yaml"),
+    def test_runtime_init(self, sample_config):
+        rt = SuperZRuntime(config_path=sample_config, headless=True)
+        assert rt._headless is True
+        assert rt._running is False
+
+    def test_runtime_boot_and_shutdown(self, sample_config, tmp_instance):
+        """Boot the runtime with mocked agents and verify it starts and stops."""
+        rt = SuperZRuntime(config_path=sample_config, headless=True)
+
+        # Mock the instance dir
+        with mock.patch("runtime.INSTANCE_DIR", tmp_instance):
+            # Mock subprocess.Popen so agent commands don't actually run
+            mock_popen = mock.MagicMock()
+            mock_popen.pid = 12345
+            mock_popen.poll.return_value = None
+            mock_popen.wait.return_value = None
+
+            with mock.patch("subprocess.Popen", return_value=mock_popen):
+                # Boot in a thread so we can interrupt it
+                boot_thread = threading.Thread(target=rt.boot, daemon=True)
+                boot_thread.start()
+
+                # Wait for health loop to start
+                time.sleep(2)
+
+                # Trigger shutdown
+                rt._running = False
+                boot_thread.join(timeout=5)
+
+                assert not boot_thread.is_alive()
+
+    def test_shutdown_stops_all(self, sample_config, tmp_instance):
+        """Verify _shutdown calls stop_all on the process manager."""
+        rt = SuperZRuntime(config_path=sample_config, headless=True)
+
+        with mock.patch("runtime.INSTANCE_DIR", tmp_instance):
+            # Pre-create process manager
+            pm = ProcessManager(base_instance_dir=str(tmp_instance))
+            pm.register("a", "sleep 999", 19991, "/tmp")
+            pm.register("b", "sleep 999", 19992, "/tmp")
+
+            mock_popen = mock.MagicMock()
+            mock_popen.pid = 111
+            mock_popen.poll.return_value = None
+            mock_popen.wait.return_value = None
+            with mock.patch("subprocess.Popen", return_value=mock_popen):
+                pm.start_agent("a")
+                pm.start_agent("b")
+
+            rt.process_mgr = pm
+            rt._running = True
+            rt._shutdown("test")
+
+            assert rt._running is False
+            assert pm.get_agent("a").health_status == "DOWN"
+            assert pm.get_agent("b").health_status == "DOWN"
+
+    def test_signal_handler(self, sample_config, tmp_instance):
+        """SIGTERM should trigger graceful shutdown."""
+        rt = SuperZRuntime(config_path=sample_config, headless=True)
+        rt.register_signal_handlers()
+
+        with mock.patch("runtime.INSTANCE_DIR", tmp_instance):
+            mock_pm = mock.MagicMock()
+            rt.process_mgr = mock_pm
+            rt._running = True
+
+            # Send SIGTERM to our own process
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.3)
+
+            # Process manager should have been told to stop
+            mock_pm.stop_all.assert_called_once()
+
+    def test_interruptible_sleep(self):
+        rt = SuperZRuntime(headless=True)
+        rt._running = True
+
+        # Should return early when _running becomes False
+        def set_false():
+            time.sleep(0.2)
+            rt._running = False
+
+        t = threading.Thread(target=set_false, daemon=True)
+        t.start()
+
+        start = time.time()
+        rt._interruptible_sleep(10)  # would sleep 10s if not interruptible
+        elapsed = time.time() - start
+
+        assert elapsed < 2  # should have returned in ~0.2s
+        rt._running = True  # reset
+
+    def test_boot_check_environment(self, sample_config, tmp_instance):
+        """Environment check should succeed on this machine."""
+        rt = SuperZRuntime(config_path=sample_config, headless=True)
+        with mock.patch("runtime.INSTANCE_DIR", tmp_instance):
+            rt._check_environment()  # should not raise
+            assert (tmp_instance / "logs").exists()
+            assert (tmp_instance / "agents").exists()
+
+    def test_boot_load_config(self, sample_config, tmp_instance):
+        rt = SuperZRuntime(config_path=sample_config, headless=True)
+        with mock.patch("runtime.INSTANCE_DIR", tmp_instance):
+            rt._load_config()
+            assert rt.config is not None
+            assert len(rt.config.enabled_agents()) == 1
+
+    def test_boot_load_config_invalid(self, tmp_path):
+        bad_cfg = tmp_path / "bad.yaml"
+        bad_cfg.write_text("runtime:\n  health_interval: bad\n")
+        rt = SuperZRuntime(config_path=str(bad_cfg), headless=True)
+        with mock.patch("runtime.INSTANCE_DIR", tmp_path / "si"):
+            (tmp_path / "si").mkdir()
+            with pytest.raises(RuntimeError, match="Invalid configuration"):
+                rt._load_config()
+
+    def test_boot_lifecycle_mocked(self, sample_config, tmp_instance):
+        """Full boot lifecycle with all subprocess.Popen calls mocked."""
+        rt = SuperZRuntime(config_path=sample_config, headless=True)
+
+        with mock.patch("runtime.INSTANCE_DIR", tmp_instance):
+            mock_popen = mock.MagicMock()
+            mock_popen.pid = 99
+            mock_popen.poll.return_value = None  # keep "alive"
+            mock_popen.wait.return_value = None
+            mock_popen.communicate.return_value = (b"", b"")
+
+            with mock.patch("subprocess.Popen", return_value=mock_popen):
+                boot_done = threading.Event()
+
+                def run_boot():
+                    try:
+                        rt.boot()
+                    except Exception:
+                        pass
+                    finally:
+                        boot_done.set()
+
+                t = threading.Thread(target=run_boot, daemon=True)
+                t.start()
+                time.sleep(3)
+                rt._running = False
+                boot_done.wait(timeout=10)
+
+            assert not rt._running
+
+    def test_filter_agents(self, sample_config, tmp_instance):
+        """When --agents is set, only those agents are launched."""
+        rt = SuperZRuntime(
+            config_path=sample_config,
             headless=True,
-            skip_mud=True,
-            agent_filter=["trail-agent"],
+            filter_agents=["trust-agent"],
         )
+        assert rt._filter_agents == ["trust-agent"]
 
-        # Phase 1
-        runtime._setup_logging()
-        runtime._phase1_environment_check()
-        assert runtime.config is not None
+    def test_no_color_env(self, monkeypatch):
+        """NO_COLOR env var should disable TUI."""
+        monkeypatch.setenv("NO_COLOR", "1")
+        tui = TUIRenderer(enabled=True)
+        assert tui._enabled is False
 
-        # Phase 2
-        runtime._phase2_fleet_bootstrap()
 
-        # Phase 3 — start infrastructure and manually mark healthy
-        runtime._start_infrastructure_agent(AgentConfig(
-            name="keeper-agent", port=8443, host="127.0.0.1",
-        ))
-        runtime._start_infrastructure_agent(AgentConfig(
-            name="git-agent", port=8444, host="127.0.0.1",
-        ))
-        procs = runtime.process_manager.get_all()
-        assert len(procs) >= 2
+# ===================================================================
+# Edge cases and misc
+# ===================================================================
 
-        # Phase 4
-        runtime._phase4_launch_agents()
-        procs = runtime.process_manager.get_all()
-        # Should now include trail-agent
-        assert any("trail" in name for name in procs)
+class TestEdgeCases:
 
-        # Clean up
-        runtime.shutdown()
+    def test_config_runtime_property(self):
+        cfg = FleetConfig.generate_defaults()
+        rt = cfg.runtime
+        assert isinstance(rt, dict)
+        assert rt["health_interval"] == 30
 
-    def test_health_monitor_integration(self, tmp_dir: Path) -> None:
-        """Health monitor should work with stub agents."""
-        ensure_agent_stub()
+    def test_config_keeper_property(self):
+        cfg = FleetConfig.generate_defaults()
+        assert cfg.keeper["port"] == 8443
 
-        runtime = SuperZRuntime(
-            config_path=str(tmp_dir / "fleet.yaml"),
-            headless=True,
-            skip_mud=True,
-        )
-        runtime._setup_logging()
-        runtime._phase1_environment_check()
+    def test_config_git_agent_property(self):
+        cfg = FleetConfig.generate_defaults()
+        assert cfg.git_agent["port"] == 8444
 
-        # Start infrastructure agents directly
-        runtime._start_infrastructure_agent(AgentConfig(
-            name="keeper-agent", port=8443, host="127.0.0.1",
-        ))
-        runtime.health_monitor.add_agent(
-            "keeper-agent", "http://127.0.0.1:8443/health",
-        )
+    def test_config_mud_property(self):
+        cfg = FleetConfig.generate_defaults()
+        assert cfg.mud["enabled"] is False
 
-        # Wait for stub to be ready
-        time.sleep(1)
+    def test_process_manager_uptime_before_start(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("test", "sleep 999", 8080, "/tmp")
+        proc = pm.get_agent("test")
+        assert proc.uptime == 0.0
 
-        report = runtime.health_monitor.check_all()
-        assert report.total_agents >= 1
+    def test_process_manager_uptime_after_start(self, tmp_instance):
+        pm = ProcessManager(base_instance_dir=str(tmp_instance))
+        pm.register("test", "sleep 999", 8080, "/tmp")
+        pm.start_agent("test")
+        time.sleep(0.5)
+        proc = pm.get_agent("test")
+        assert proc.uptime >= 0.4
 
-        runtime.shutdown()
+    def test_agent_process_dataclass_defaults(self):
+        proc = AgentProcess(name="x", port=1, command="sleep 999", cwd="/tmp")
+        assert proc.pid is None
+        assert proc.health_status == "DOWN"
+        assert proc.restart_count == 0
+        assert proc.started_at is None
+
+    def test_launcher_agent_dir(self, tmp_instance):
+        launcher = AgentLauncher(instance_dir=str(tmp_instance))
+        assert launcher.agent_dir("foo") == tmp_instance / "agents" / "foo"

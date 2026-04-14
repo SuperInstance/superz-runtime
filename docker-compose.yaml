@@ -1,117 +1,44 @@
-# ============================================================
-# SuperZ Runtime — Docker Compose Fleet Stack
-# ============================================================
-# Usage:
-#   docker compose up -d          # start full fleet
-#   docker compose logs -f        # follow logs
-#   docker compose down           # stop fleet
-# ============================================================
+version: "3.9"
 
 services:
-  # ── Main Runtime Orchestrator ──────────────────────────────
+  # ── SuperZ Runtime (orchestrator) ─────────────────────────────────
   superz-runtime:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: superz-runtime
     restart: unless-stopped
     ports:
-      - "8443:8443"    # Keeper Agent
-      - "8444:8444"    # Git Agent
-      - "7777:7777"    # MUD Server
-      - "8501:8501"    # Trail Agent
-      - "8502:8502"    # Trust Agent
-      - "8503:8503"    # Flux VM Agent
-      - "8504:8504"    # Knowledge Agent
-      - "8505:8505"    # Scheduler Agent
-      - "8506:8506"    # Edge Relay
-      - "8507:8507"    # Liaison Agent
-      - "8508:8508"    # Cartridge Agent
+      - "8443:8443"   # keeper
+      - "8444:8444"   # git-agent
+      - "7777:7777"   # mud (optional)
+      - "8501-8512:8501-8512"  # fleet agents
     volumes:
-      - superz-data:/root/.superinstance
+      - superz-data:/home/superz/.superinstance
     environment:
       - SUPERZ_HEADLESS=true
-      - SUPERZ_LOG_LEVEL=INFO
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-    healthcheck:
-      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8443/health', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-    networks:
-      - fleet-network
+    command: ["python", "-m", "superz_runtime", "--headless"]
 
-  # ── Keeper Agent (standalone, optional) ───────────────────
-  keeper:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: superz-keeper
-    restart: unless-stopped
-    command: ["--headless", "--agents", "keeper"]
-    ports:
-      - "8443:8443"
-    volumes:
-      - superz-data:/root/.superinstance
-    environment:
-      - SUPERZ_HEADLESS=true
-      - KEEPER_PORT=8443
-    depends_on:
-      - postgres
-    networks:
-      - fleet-network
-    profiles:
-      - standalone
+  # ── Keeper (optional — separate container) ────────────────────────
+  # keeper:
+  #   build:
+  #     context: ./agents/keeper-agent
+  #     dockerfile: Dockerfile
+  #   container_name: keeper-agent
+  #   ports:
+  #     - "8443:8443"
+  #   volumes:
+  #     - superz-data:/data/keeper
 
-  # ── Holodeck MUD Server (standalone, optional) ────────────
-  holodeck:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: superz-holodeck
-    restart: unless-stopped
-    command: ["--headless", "--skip-mud"]
-    ports:
-      - "7777:7777"
-    volumes:
-      - superz-data:/root/.superinstance
-    environment:
-      - MUD_PORT=7777
-    networks:
-      - fleet-network
-    profiles:
-      - standalone
-
-  # ── PostgreSQL for Keeper Persistence (optional) ──────────
-  postgres:
-    image: postgres:16-alpine
-    container_name: superz-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: superz_keeper
-      POSTGRES_USER: superz
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-superz_dev}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U superz -d superz_keeper"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    networks:
-      - fleet-network
-    profiles:
-      - with-db
+  # ── Holodeck / MUD (optional) ────────────────────────────────────
+  # holodeck:
+  #   build:
+  #     context: ./holodeck-studio
+  #     dockerfile: Dockerfile
+  #   container_name: holodeck-mud
+  #   ports:
+  #     - "7777:7777"
+  #   environment:
+  #     - MUD_PORT=7777
 
 volumes:
   superz-data:
     driver: local
-  postgres-data:
-    driver: local
-
-networks:
-  fleet-network:
-    driver: bridge
